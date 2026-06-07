@@ -66,7 +66,7 @@ DEFAULT_PLAYBACK_RATE = 2.0
 # Pi 4B: 24 fps is well within tkinter's redraw budget on a 1080p display
 TARGET_RENDER_FPS = 24
 
-ASR_SAMPLE_RATE = 16_000
+ASR_SAMPLE_RATE = 48_000
 
 # Pi 4B FIX: larger block == fewer callbacks == no input overflow.
 # 16 000 samples @ 16 kHz = 1 second per block, well within Vosk latency budget.
