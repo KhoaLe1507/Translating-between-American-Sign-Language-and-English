@@ -64,6 +64,24 @@ def parse_bool_env(value: str) -> bool:
     return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
 
+def make_translucent_overlay(width: int, height: int, *, alpha: int = 176) -> tk.PhotoImage:
+    width = max(1, int(width))
+    height = max(1, int(height))
+    alpha = max(0, min(255, int(alpha)))
+    # OpenCV encodes 4-channel PNG arrays as BGRA. Tk PhotoImage keeps the
+    # alpha channel, which gives a real translucent video subtitle plate.
+    pixels = np.zeros((height, width, 4), dtype=np.uint8)
+    pixels[:, :, 0] = 32
+    pixels[:, :, 1] = 18
+    pixels[:, :, 2] = 11
+    pixels[:, :, 3] = alpha
+    ok, png = cv2.imencode(".png", pixels)
+    if not ok:
+        raise RuntimeError("failed to build translucent overlay image")
+    encoded = base64.b64encode(png.tobytes()).decode("ascii")
+    return tk.PhotoImage(data=encoded, format="PNG")
+
+
 def option_provided(argv: list[str], *options: str) -> bool:
     for option in options:
         if option in argv:
@@ -247,10 +265,21 @@ def build_pose_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--concurrency", type=int, default=pose_client.DEFAULT_CONCURRENCY)
     parser.add_argument("--playback-rate", type=float, default=pose_client.DEFAULT_PLAYBACK_RATE)
+    parser.add_argument(
+        "--pose-render-fps",
+        type=float,
+        default=float(os.environ.get("POSE_RENDER_FPS", "30")),
+        help="Target UI redraw FPS for the skeleton pose renderer.",
+    )
     parser.add_argument("--sample-rate", type=int, default=pose_client.ASR_SAMPLE_RATE)
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--model", default=None)
-    parser.add_argument("--interpolate", action="store_true", default=False)
+    parser.add_argument(
+        "--interpolate",
+        action=argparse.BooleanOptionalAction,
+        default=parse_bool_env(os.environ.get("POSE_INTERPOLATE", "1")),
+        help="Interpolate between pose frames for smoother skeleton motion.",
+    )
     parser.add_argument("--demo-text", nargs="*", default=None)
     parser.add_argument("--auto-close-seconds", type=float, default=0.0)
     parser.add_argument("--self-test", default=None)
@@ -299,6 +328,7 @@ def parse_dual_args(argv: list[str]) -> tuple[argparse.Namespace, argparse.Names
         pose_parser.error("--asr-backend must be faster-whisper, browser, whisper, or vosk")
     pose_args.concurrency = max(1, int(pose_args.concurrency))
     pose_args.playback_rate = max(0.1, float(pose_args.playback_rate))
+    pose_args.pose_render_fps = max(1.0, float(pose_args.pose_render_fps))
     pose_args.faster_whisper_beam_size = max(1, int(pose_args.faster_whisper_beam_size))
     pose_args.faster_whisper_cpu_threads = max(0, int(pose_args.faster_whisper_cpu_threads))
 
@@ -378,35 +408,17 @@ class SignToSpeechPanel:
     def __init__(self, parent: tk.Widget, *, mirror_camera: bool):
         self.mirror_camera = mirror_camera
         self.photo: Optional[tk.PhotoImage] = None
+        self.overlay_photo: Optional[tk.PhotoImage] = None
+        self.overlay_photo_size: tuple[int, int] = (0, 0)
         self.last_frame: Optional[np.ndarray] = None
         self.last_snapshot: dict[str, object] = {}
+        self.subtitle_text = "Waiting for ASL input..."
+        self.status_text = "Starting"
 
-        self.container = tk.Frame(parent, bg="#ffffff", highlightthickness=1, highlightbackground="#d7dde5")
-        self.container.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        self.container.rowconfigure(1, weight=1)
+        self.container = tk.Frame(parent, bg="#121826", highlightthickness=0, bd=0)
+        self.container.grid(row=0, column=0, sticky="nsew")
+        self.container.rowconfigure(0, weight=1)
         self.container.columnconfigure(0, weight=1)
-
-        header = tk.Frame(self.container, bg="#ffffff")
-        header.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 8))
-        header.columnconfigure(0, weight=1)
-        tk.Label(
-            header,
-            text="ASL to English",
-            bg="#ffffff",
-            fg="#172033",
-            font=("Segoe UI", 15, "bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="ew")
-        self.status_chip = tk.Label(
-            header,
-            text="Starting",
-            bg="#e8f6ef",
-            fg="#14734f",
-            padx=12,
-            pady=5,
-            font=("Segoe UI", 9, "bold"),
-        )
-        self.status_chip.grid(row=0, column=1, sticky="e")
 
         self.canvas = tk.Canvas(
             self.container,
@@ -414,63 +426,8 @@ class SignToSpeechPanel:
             highlightthickness=0,
             bd=0,
         )
-        self.canvas.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 10))
+        self.canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.canvas.bind("<Configure>", lambda _event: self.render_frame())
-
-        subtitle = tk.Frame(self.container, bg="#f8fafc", highlightthickness=1, highlightbackground="#e1e6ee")
-        subtitle.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
-        subtitle.columnconfigure(0, weight=1)
-        tk.Label(
-            subtitle,
-            text="CAMERA SUBTITLE",
-            bg="#f8fafc",
-            fg="#526175",
-            font=("Segoe UI", 8, "bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="ew", padx=12, pady=(9, 0))
-        self.subtitle_label = tk.Label(
-            subtitle,
-            text="Waiting for ASL input...",
-            bg="#f8fafc",
-            fg="#111827",
-            font=("Segoe UI", 16, "bold"),
-            anchor="w",
-            justify="left",
-        )
-        self.subtitle_label.grid(row=1, column=0, sticky="ew", padx=12, pady=(3, 10))
-        subtitle.bind("<Configure>", self._update_subtitle_wrap)
-
-        metrics = tk.Frame(self.container, bg="#ffffff")
-        metrics.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 12))
-        for col in range(4):
-            metrics.columnconfigure(col, weight=1)
-        self.metric_session = self._metric(metrics, "Session", "none", 0)
-        self.metric_chunks = self._metric(metrics, "Chunks", "0", 1)
-        self.metric_pending = self._metric(metrics, "Pending", "0", 2)
-        self.metric_inflight = self._metric(metrics, "Inflight", "0", 3)
-
-    def _metric(self, parent: tk.Frame, title: str, value: str, column: int) -> tk.Label:
-        box = tk.Frame(parent, bg="#f7f9fb", highlightthickness=1, highlightbackground="#e5eaf0")
-        box.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 6, 0))
-        tk.Label(
-            box,
-            text=title,
-            bg="#f7f9fb",
-            fg="#697789",
-            font=("Segoe UI", 8, "bold"),
-        ).pack(anchor="w", padx=9, pady=(7, 0))
-        label = tk.Label(
-            box,
-            text=value,
-            bg="#f7f9fb",
-            fg="#172033",
-            font=("Segoe UI", 11, "bold"),
-        )
-        label.pack(anchor="w", padx=9, pady=(1, 7))
-        return label
-
-    def _update_subtitle_wrap(self, event) -> None:
-        self.subtitle_label.configure(wraplength=max(240, event.width - 26))
 
     def update_state(self, snapshot: dict[str, object]) -> None:
         self.last_snapshot = snapshot
@@ -480,12 +437,16 @@ class SignToSpeechPanel:
         final = str(snapshot.get("final") or "")
         subtitle = final or draft or detail or "Waiting for ASL input..."
 
-        self.status_chip.configure(text=status[:32])
-        self.subtitle_label.configure(text=subtitle)
-        self.metric_session.configure(text=str(snapshot.get("session_short") or "none"))
-        self.metric_chunks.configure(text=str(snapshot.get("chunks_sent") or 0))
-        self.metric_pending.configure(text=str(snapshot.get("pending_uploads") or 0))
-        self.metric_inflight.configure(text=str(snapshot.get("inflight_uploads") or 0))
+        status_bits = [
+            f"Status: {status}",
+            f"Session: {snapshot.get('session_short') or 'none'}",
+            f"Chunks: {snapshot.get('chunks_sent') or 0}",
+            f"Pending: {snapshot.get('pending_uploads') or 0}",
+            f"Inflight: {snapshot.get('inflight_uploads') or 0}",
+        ]
+        self.status_text = "  |  ".join(status_bits)
+        self.subtitle_text = subtitle
+        self.render_frame()
 
     def update_frame(self, frame_bgr: np.ndarray, snapshot: dict[str, object]) -> None:
         self.last_frame = frame_bgr
@@ -506,6 +467,8 @@ class SignToSpeechPanel:
                 fill="#cbd5e1",
                 font=("Segoe UI", 13, "bold"),
             )
+            if width > 8 and height > 8:
+                self._draw_overlay(width, height)
             return
 
         frame = self.last_frame
@@ -529,6 +492,54 @@ class SignToSpeechPanel:
         encoded = base64.b64encode(png.tobytes()).decode("ascii")
         self.photo = tk.PhotoImage(data=encoded, format="PNG")
         self.canvas.create_image(width / 2, height / 2, image=self.photo, anchor=tk.CENTER)
+        self._draw_overlay(width, height)
+
+    def _draw_overlay(self, width: int, height: int) -> None:
+        overlay_width = max(260, int(width * 0.92))
+        overlay_height = min(max(112, int(height * 0.18)), 160)
+        x = int((width - overlay_width) / 2)
+        y = max(12, height - overlay_height - 22)
+
+        if self.overlay_photo is None or self.overlay_photo_size != (overlay_width, overlay_height):
+            self.overlay_photo = make_translucent_overlay(overlay_width, overlay_height, alpha=178)
+            self.overlay_photo_size = (overlay_width, overlay_height)
+
+        self.canvas.create_image(x, y, image=self.overlay_photo, anchor=tk.NW)
+        self.canvas.create_rectangle(
+            x,
+            y,
+            x + overlay_width,
+            y + overlay_height,
+            outline="#334155",
+            width=1,
+        )
+        self.canvas.create_text(
+            x + 16,
+            y + 13,
+            text="ASL TO ENGLISH",
+            fill="#93c5fd",
+            font=("Segoe UI", 8, "bold"),
+            anchor=tk.NW,
+        )
+        self.canvas.create_text(
+            x + 16,
+            y + 35,
+            text=self.status_text,
+            fill="#cbd5e1",
+            font=("Segoe UI", 9, "bold"),
+            anchor=tk.NW,
+            width=overlay_width - 32,
+        )
+        self.canvas.create_text(
+            x + overlay_width / 2,
+            y + overlay_height - 38,
+            text=self.subtitle_text,
+            fill="#ffffff",
+            font=("Segoe UI", 18, "bold"),
+            anchor=tk.CENTER,
+            justify=tk.CENTER,
+            width=overlay_width - 32,
+        )
 
 
 class BrowserSpeechAsr:
@@ -1316,19 +1327,26 @@ class SpeechPosePanel:
         self.cache: dict[str, pose_client.PoseSequence] = {}
         self.executor = ThreadPoolExecutor(max_workers=args.concurrency)
         self.closed = False
+        self.overlay_photo: Optional[tk.PhotoImage] = None
+        self.overlay_photo_size: tuple[int, int] = (0, 0)
+        self.current_overlay_text = "Listening..."
+        self.next_overlay_text = "Waiting for speech"
+        self.status_overlay_text = "ASR: Starting  |  API: Idle"
 
-        self.container = tk.Frame(parent, bg="#ffffff", highlightthickness=1, highlightbackground="#d7dde5")
-        self.container.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
-        self.container.rowconfigure(1, weight=1)
+        self.container = tk.Frame(parent, bg="#f7f8f6", highlightthickness=0, bd=0)
+        self.container.grid(row=0, column=1, sticky="nsew")
+        self.container.rowconfigure(0, weight=1)
         self.container.columnconfigure(0, weight=1)
 
         self._build_ui()
+        pose_client.TARGET_RENDER_FPS = float(args.pose_render_fps)
         self.renderer = pose_client.SkeletonPoseRenderer(
             self.root,
             self.canvas,
             args.playback_rate,
             use_interpolation=args.interpolate,
         )
+        self._install_renderer_overlay()
         if args.asr_backend == "faster-whisper":
             self.asr = FasterWhisperStreamingAsr(
                 model_name=args.faster_whisper_model,
@@ -1380,112 +1398,98 @@ class SpeechPosePanel:
                 on_status=lambda status: self.safe_after(lambda: self.set_asr_status(status)),
             )
 
-    def _build_ui(self) -> None:
-        header = tk.Frame(self.container, bg="#ffffff")
-        header.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 8))
-        header.columnconfigure(0, weight=1)
-        tk.Label(
-            header,
-            text="English to ASL Pose",
-            bg="#ffffff",
-            fg="#172033",
-            font=("Segoe UI", 15, "bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="ew")
-        self.asr_chip = tk.Label(
-            header,
-            text="ASR Starting",
-            bg="#eaf2ff",
-            fg="#2457a6",
-            padx=12,
-            pady=5,
-            font=("Segoe UI", 9, "bold"),
-        )
-        self.asr_chip.grid(row=0, column=1, sticky="e", padx=(0, 8))
-        self.api_chip = tk.Label(
-            header,
-            text="API Idle",
-            bg="#fff7e6",
-            fg="#9a5b00",
-            padx=12,
-            pady=5,
-            font=("Segoe UI", 9, "bold"),
-        )
-        self.api_chip.grid(row=0, column=2, sticky="e")
+    def _install_renderer_overlay(self) -> None:
+        original_render = self.renderer.render_current_frame
 
+        def render_with_overlay() -> None:
+            original_render()
+            self.draw_overlay()
+
+        self.renderer.render_current_frame = render_with_overlay
+
+    def _build_ui(self) -> None:
         self.canvas = tk.Canvas(
             self.container,
             bg="#f7f8f6",
             highlightthickness=0,
             bd=0,
         )
-        self.canvas.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 10))
+        self.canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.canvas.bind("<Configure>", lambda _event: self.draw_overlay())
 
-        subtitle = tk.Frame(self.container, bg="#f8fafc", highlightthickness=1, highlightbackground="#e1e6ee")
-        subtitle.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
-        subtitle.columnconfigure(0, weight=1)
-        tk.Label(
-            subtitle,
-            text="POSE VIDEO SUBTITLE",
-            bg="#f8fafc",
-            fg="#526175",
+    def draw_overlay(self) -> None:
+        width = max(1, self.canvas.winfo_width())
+        height = max(1, self.canvas.winfo_height())
+        if width <= 8 or height <= 8:
+            return
+
+        self.canvas.delete("subtitle_overlay")
+        overlay_width = max(260, int(width * 0.92))
+        overlay_height = min(max(132, int(height * 0.22)), 178)
+        x = int((width - overlay_width) / 2)
+        y = max(12, height - overlay_height - 22)
+
+        if self.overlay_photo is None or self.overlay_photo_size != (overlay_width, overlay_height):
+            self.overlay_photo = make_translucent_overlay(overlay_width, overlay_height, alpha=178)
+            self.overlay_photo_size = (overlay_width, overlay_height)
+
+        self.canvas.create_image(
+            x,
+            y,
+            image=self.overlay_photo,
+            anchor=tk.NW,
+            tags=("subtitle_overlay",),
+        )
+        self.canvas.create_rectangle(
+            x,
+            y,
+            x + overlay_width,
+            y + overlay_height,
+            outline="#334155",
+            width=1,
+            tags=("subtitle_overlay",),
+        )
+        self.canvas.create_text(
+            x + 16,
+            y + 13,
+            text="ENGLISH TO ASL POSE",
+            fill="#86efac",
             font=("Segoe UI", 8, "bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="ew", padx=12, pady=(9, 0))
-        self.current_label = tk.Label(
-            subtitle,
-            text="Listening...",
-            bg="#f8fafc",
-            fg="#111827",
-            font=("Segoe UI", 16, "bold"),
-            anchor="w",
-            justify="left",
+            anchor=tk.NW,
+            tags=("subtitle_overlay",),
         )
-        self.current_label.grid(row=1, column=0, sticky="ew", padx=12, pady=(3, 4))
-        self.next_label = tk.Label(
-            subtitle,
-            text="Waiting for speech",
-            bg="#f8fafc",
-            fg="#4b5563",
-            font=("Segoe UI", 10, "bold"),
-            anchor="w",
-            justify="left",
+        self.canvas.create_text(
+            x + 16,
+            y + 35,
+            text=self.status_overlay_text,
+            fill="#cbd5e1",
+            font=("Segoe UI", 9, "bold"),
+            anchor=tk.NW,
+            width=overlay_width - 32,
+            tags=("subtitle_overlay",),
         )
-        self.next_label.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
-        subtitle.bind("<Configure>", self._update_wraplength)
-
-        metrics = tk.Frame(self.container, bg="#ffffff")
-        metrics.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 12))
-        for col in range(3):
-            metrics.columnconfigure(col, weight=1)
-        self.metric_queue = self._metric(metrics, "Queue", "0", 0)
-        self.metric_active = self._metric(metrics, "Rendering", "Idle", 1)
-        self.metric_cache = self._metric(metrics, "Cache", "0", 2)
-
-    def _metric(self, parent: tk.Frame, title: str, value: str, column: int) -> tk.Label:
-        box = tk.Frame(parent, bg="#f7f9fb", highlightthickness=1, highlightbackground="#e5eaf0")
-        box.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 6, 0))
-        tk.Label(
-            box,
-            text=title,
-            bg="#f7f9fb",
-            fg="#697789",
-            font=("Segoe UI", 8, "bold"),
-        ).pack(anchor="w", padx=9, pady=(7, 0))
-        label = tk.Label(
-            box,
-            text=value,
-            bg="#f7f9fb",
-            fg="#172033",
-            font=("Segoe UI", 11, "bold"),
+        self.canvas.create_text(
+            x + overlay_width / 2,
+            y + overlay_height - 56,
+            text=self.current_overlay_text,
+            fill="#ffffff",
+            font=("Segoe UI", 18, "bold"),
+            anchor=tk.CENTER,
+            justify=tk.CENTER,
+            width=overlay_width - 32,
+            tags=("subtitle_overlay",),
         )
-        label.pack(anchor="w", padx=9, pady=(1, 7))
-        return label
-
-    def _update_wraplength(self, event) -> None:
-        wrap = max(240, event.width - 26)
-        self.current_label.configure(wraplength=wrap)
-        self.next_label.configure(wraplength=wrap)
+        self.canvas.create_text(
+            x + overlay_width / 2,
+            y + overlay_height - 22,
+            text=self.next_overlay_text,
+            fill="#cbd5e1",
+            font=("Segoe UI", 10),
+            anchor=tk.CENTER,
+            justify=tk.CENTER,
+            width=overlay_width - 32,
+            tags=("subtitle_overlay",),
+        )
 
     def start(self) -> None:
         self.renderer.paint_idle("Listening")
@@ -1659,14 +1663,18 @@ class SpeechPosePanel:
         self.render_subtitles()
 
     def render_subtitles(self) -> None:
-        self.current_label.configure(text=self.current_subtitle_text())
-        self.next_label.configure(text=self.next_subtitle_text())
-        self.asr_chip.configure(text=f"ASR {self.asr_status[:24]}")
-        self.api_chip.configure(text=f"API {self.api_status[:24]}")
         waiting = len([item for item in self.items if item.status not in ("done", "skipped")])
-        self.metric_queue.configure(text=str(waiting))
-        self.metric_active.configure(text="Yes" if self.active_item else "Idle")
-        self.metric_cache.configure(text=str(len(self.cache)))
+        status_bits = [
+            f"ASR: {self.asr_status[:32]}",
+            f"API: {self.api_status[:24]}",
+            f"Queue: {waiting}",
+            f"Rendering: {'Yes' if self.active_item else 'Idle'}",
+            f"Cache: {len(self.cache)}",
+        ]
+        self.current_overlay_text = self.current_subtitle_text()
+        self.next_overlay_text = self.next_subtitle_text()
+        self.status_overlay_text = "  |  ".join(status_bits)
+        self.draw_overlay()
 
     def current_subtitle_text(self) -> str:
         if self.active_item:
@@ -2008,73 +2016,11 @@ class DualTranslatorDashboard:
         self.bridge.start()
 
     def _build_ui(self) -> None:
-        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(0, weight=1)
         self.root.columnconfigure(0, weight=1)
 
-        header = tk.Frame(self.root, bg="#eef2f6")
-        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 10))
-        header.columnconfigure(0, weight=1)
-
-        tk.Label(
-            header,
-            text="Bidirectional English / ASL Interpreter",
-            bg="#eef2f6",
-            fg="#111827",
-            font=("Segoe UI", 18, "bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="ew")
-        tk.Label(
-            header,
-            text="Live camera translation and speech-driven pose rendering",
-            bg="#eef2f6",
-            fg="#536274",
-            font=("Segoe UI", 10),
-            anchor="w",
-        ).grid(row=1, column=0, sticky="ew", pady=(2, 0))
-
-        self.start_button = tk.Button(
-            header,
-            text="Start",
-            command=self.start,
-            bg="#1f6feb",
-            fg="#ffffff",
-            activebackground="#195cc5",
-            activeforeground="#ffffff",
-            relief=tk.FLAT,
-            padx=14,
-            pady=7,
-            font=("Segoe UI", 10, "bold"),
-        )
-        self.start_button.grid(row=0, column=1, rowspan=2, padx=(8, 0), sticky="e")
-        self.stop_button = tk.Button(
-            header,
-            text="Stop",
-            command=self.stop,
-            bg="#f3f6fa",
-            fg="#172033",
-            activebackground="#e4eaf2",
-            relief=tk.FLAT,
-            padx=14,
-            pady=7,
-            font=("Segoe UI", 10, "bold"),
-        )
-        self.stop_button.grid(row=0, column=2, rowspan=2, padx=(8, 0), sticky="e")
-        self.quit_button = tk.Button(
-            header,
-            text="Quit",
-            command=self.close,
-            bg="#f3f6fa",
-            fg="#172033",
-            activebackground="#e4eaf2",
-            relief=tk.FLAT,
-            padx=14,
-            pady=7,
-            font=("Segoe UI", 10, "bold"),
-        )
-        self.quit_button.grid(row=0, column=3, rowspan=2, padx=(8, 0), sticky="e")
-
-        self.main_area = tk.Frame(self.root, bg="#eef2f6")
-        self.main_area.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        self.main_area = tk.Frame(self.root, bg="#111827")
+        self.main_area.grid(row=0, column=0, sticky="nsew")
         self.main_area.rowconfigure(0, weight=1)
         self.main_area.columnconfigure(0, weight=1, uniform="halves")
         self.main_area.columnconfigure(1, weight=1, uniform="halves")
@@ -2083,26 +2029,13 @@ class DualTranslatorDashboard:
             self.main_area,
             mirror_camera=bool(self.dashboard_args.mirror_camera),
         )
-
-        footer = tk.Frame(self.root, bg="#eef2f6")
-        footer.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 12))
-        footer.columnconfigure(0, weight=1)
-        self.footer_label = tk.Label(
-            footer,
-            text="Ready",
-            bg="#eef2f6",
-            fg="#536274",
-            font=("Segoe UI", 9),
-            anchor="w",
-        )
-        self.footer_label.grid(row=0, column=0, sticky="ew")
+        divider = tk.Frame(self.main_area, bg="#0f172a", width=2)
+        divider.place(relx=0.5, rely=0, relheight=1, anchor="n")
 
     def start(self) -> None:
         if self.started:
             return
         self.started = True
-        self.footer_label.configure(text="Both translation pipelines are running independently.")
-        self.start_button.configure(state=tk.DISABLED)
         self.sign_thread.start()
         self.pose_panel.start()
         if self.pose_args.auto_close_seconds > 0:
@@ -2111,7 +2044,6 @@ class DualTranslatorDashboard:
     def stop(self) -> None:
         self.sign_client.stop_event.set()
         self.pose_panel.close()
-        self.footer_label.configure(text="Stopping background pipelines...")
 
     def close(self) -> None:
         if self.closing:

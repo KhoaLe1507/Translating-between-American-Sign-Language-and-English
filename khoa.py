@@ -763,12 +763,14 @@ class SkeletonPoseRenderer:
         self.next_tick_at = 0.0
         # Pi 4B dirty-flag: only redraw when frame index changes
         self._last_rendered_frame_index: int = -1
+        self._last_rendered_frame_position: float = -1.0
         self._last_canvas_size: tuple[int, int] = (0, 0)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
     def _on_canvas_resize(self, _event) -> None:
         # Force redraw on resize by invalidating dirty flag
         self._last_rendered_frame_index = -1
+        self._last_rendered_frame_position = -1.0
         self.render_current_frame()
 
     def play(
@@ -780,6 +782,7 @@ class SkeletonPoseRenderer:
         self.frame_index = 0
         self.frame_position = 0.0
         self._last_rendered_frame_index = -1
+        self._last_rendered_frame_position = -1.0
         self.started_at = time.perf_counter()
         self.next_tick_at = self.started_at + self.target_frame_interval
         self.playing = True
@@ -805,6 +808,7 @@ class SkeletonPoseRenderer:
         self.frame_index = 0
         self.frame_position = 0.0
         self._last_rendered_frame_index = -1
+        self._last_rendered_frame_position = -1.0
         self.idle_label = label
         self.render_current_frame()
 
@@ -854,16 +858,22 @@ class SkeletonPoseRenderer:
         height = max(180, self.canvas.winfo_height())
         canvas_size = (width, height)
 
+        frame_position_changed = (
+            abs(self.frame_position - self._last_rendered_frame_position) > 0.001
+        )
         # Pi 4B dirty-flag: skip expensive canvas.delete("all") + redraw when
-        # nothing has changed.
+        # nothing has changed. Interpolation needs sub-frame redraws, so it
+        # also tracks frame_position instead of only the integer frame index.
         if (
             self.frame_index == self._last_rendered_frame_index
+            and (not self.use_interpolation or not frame_position_changed)
             and canvas_size == self._last_canvas_size
             and self.pose is not None  # always redraw idle state
         ):
             return
 
         self._last_rendered_frame_index = self.frame_index
+        self._last_rendered_frame_position = self.frame_position
         self._last_canvas_size = canvas_size
 
         self.canvas.delete("all")
