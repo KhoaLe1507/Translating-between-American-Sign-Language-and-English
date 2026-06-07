@@ -148,7 +148,7 @@ def build_pose_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--faster-whisper-model",
-        default=os.environ.get("FASTER_WHISPER_MODEL", "small.en"),
+        default=os.environ.get("FASTER_WHISPER_MODEL", "tiny.en"),
         help="Faster-Whisper model name/path, e.g. base.en, small.en, distil-large-v3, large-v3-turbo.",
     )
     parser.add_argument(
