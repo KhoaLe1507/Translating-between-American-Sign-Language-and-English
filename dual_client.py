@@ -6,6 +6,7 @@ import json
 import http.server
 import importlib.util
 import os
+import platform
 import queue
 import signal
 import socket
@@ -80,6 +81,15 @@ def make_translucent_overlay(width: int, height: int, *, alpha: int = 176) -> tk
         raise RuntimeError("failed to build translucent overlay image")
     encoded = base64.b64encode(png.tobytes()).decode("ascii")
     return tk.PhotoImage(data=encoded, format="PNG")
+
+
+def is_arm_linux() -> bool:
+    machine = platform.machine().lower()
+    system = platform.system().lower()
+    return system == "linux" and (
+        machine.startswith("arm")
+        or machine in {"aarch64", "arm64"}
+    )
 
 
 def option_provided(argv: list[str], *options: str) -> bool:
@@ -288,10 +298,46 @@ def build_pose_arg_parser() -> argparse.ArgumentParser:
 
 def build_dashboard_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--profile",
+        choices=["auto", "pi", "desktop"],
+        default=os.environ.get("DUAL_CLIENT_PROFILE", "auto").strip().lower(),
+        help="Performance profile. auto uses pi defaults on ARM Linux and desktop defaults elsewhere.",
+    )
     parser.add_argument("--dashboard-geometry", default="1366x768")
     parser.add_argument("--fullscreen", action="store_true", default=False)
     parser.add_argument("--ui-fps", type=float, default=15.0)
+    parser.add_argument(
+        "--event-poll-ms",
+        type=int,
+        default=int(os.environ.get("EVENT_POLL_MS", "16")),
+        help="Tk event bridge poll interval in milliseconds.",
+    )
     parser.add_argument("--mirror-camera", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--camera-render-format",
+        choices=["auto", "ppm", "png"],
+        default=os.environ.get("CAMERA_RENDER_FORMAT", "auto").strip().lower(),
+        help="Tk camera preview image format. ppm is lighter on Raspberry Pi; png is a compatibility fallback.",
+    )
+    parser.add_argument(
+        "--camera-display-max-width",
+        type=int,
+        default=int(os.environ.get("CAMERA_DISPLAY_MAX_WIDTH", "0")),
+        help="Cap rendered camera preview width; 0 means fit the canvas.",
+    )
+    parser.add_argument(
+        "--camera-display-max-height",
+        type=int,
+        default=int(os.environ.get("CAMERA_DISPLAY_MAX_HEIGHT", "0")),
+        help="Cap rendered camera preview height; 0 means fit the canvas.",
+    )
+    parser.add_argument(
+        "--overlay-alpha",
+        type=int,
+        default=int(os.environ.get("OVERLAY_ALPHA", "178")),
+        help="Subtitle overlay alpha from 0 to 255.",
+    )
     parser.add_argument("--no-auto-start", action="store_true", default=False)
     return parser
 
@@ -310,6 +356,179 @@ def print_combined_help() -> None:
     print(build_dashboard_arg_parser().format_help())
     print("client.py options:")
     sign_client.build_arg_parser().print_help()
+
+
+def _env_present(*names: str) -> bool:
+    return any(name in os.environ for name in names)
+
+
+def _set_default_if_unset(
+    namespace: argparse.Namespace,
+    attr: str,
+    value: object,
+    argv: list[str],
+    *options_and_envs: str,
+) -> None:
+    options = [item for item in options_and_envs if item.startswith("--")]
+    env_names = [item for item in options_and_envs if not item.startswith("--")]
+    if option_provided(argv, *options):
+        return
+    if _env_present(*env_names):
+        return
+    setattr(namespace, attr, value)
+
+
+def apply_performance_profile_defaults(
+    client_args: argparse.Namespace,
+    pose_args: argparse.Namespace,
+    dashboard_args: argparse.Namespace,
+    argv: list[str],
+) -> None:
+    profile = str(dashboard_args.profile or "auto").strip().lower()
+    if profile == "auto":
+        profile = "pi" if is_arm_linux() else "desktop"
+    dashboard_args.profile = profile
+    if profile != "pi":
+        return
+
+    _set_default_if_unset(client_args, "camera_fps", 15, argv, "--camera-fps", "CAMERA_FPS", "OPENSLT_CAMERA_FPS")
+    _set_default_if_unset(
+        client_args,
+        "camera_warmup_seconds",
+        0.8,
+        argv,
+        "--camera-warmup-seconds",
+        "CAMERA_WARMUP_SECONDS",
+        "OPENSLT_CAMERA_WARMUP_SECONDS",
+    )
+    _set_default_if_unset(client_args, "sample_fps", 8, argv, "--sample-fps", "SAMPLE_FPS", "OPENSLT_SAMPLE_FPS")
+    _set_default_if_unset(client_args, "chunk_frames", 8, argv, "--chunk-frames", "CHUNK_FRAMES", "OPENSLT_CHUNK_FRAMES")
+    _set_default_if_unset(client_args, "width", 480, argv, "--width", "FRAME_WIDTH", "OPENSLT_FRAME_WIDTH")
+    _set_default_if_unset(client_args, "height", 360, argv, "--height", "FRAME_HEIGHT", "OPENSLT_FRAME_HEIGHT")
+    _set_default_if_unset(
+        client_args,
+        "jpeg_quality",
+        55,
+        argv,
+        "--jpeg-quality",
+        "JPEG_QUALITY",
+        "OPENSLT_JPEG_QUALITY",
+    )
+    _set_default_if_unset(
+        client_args,
+        "upload_workers",
+        1,
+        argv,
+        "--upload-workers",
+        "UPLOAD_WORKERS",
+        "OPENSLT_UPLOAD_WORKERS",
+    )
+    _set_default_if_unset(
+        client_args,
+        "max_pending_uploads",
+        2,
+        argv,
+        "--max-pending-uploads",
+        "MAX_PENDING_UPLOADS",
+        "OPENSLT_MAX_PENDING_UPLOADS",
+    )
+    _set_default_if_unset(
+        client_args,
+        "server_stats_interval",
+        0,
+        argv,
+        "--server-stats-interval",
+        "SERVER_STATS_INTERVAL",
+        "OPENSLT_SERVER_STATS_INTERVAL",
+    )
+    _set_default_if_unset(
+        client_args,
+        "debug_timing",
+        False,
+        argv,
+        "--debug-timing",
+        "--no-debug-timing",
+        "DEBUG_TIMING",
+        "OPENSLT_DEBUG_TIMING",
+    )
+    _set_default_if_unset(
+        client_args,
+        "speech_debug",
+        False,
+        argv,
+        "--speech-debug",
+        "--no-speech-debug",
+        "SPEECH_DEBUG",
+        "OPENSLT_SPEECH_DEBUG",
+    )
+    _set_default_if_unset(
+        client_args,
+        "audio_cues",
+        False,
+        argv,
+        "--audio-cues",
+        "--no-audio-cues",
+        "AUDIO_CUES",
+        "OPENSLT_AUDIO_CUES",
+    )
+
+    _set_default_if_unset(pose_args, "asr_backend", "vosk", argv, "--asr-backend", "ASR_BACKEND")
+    _set_default_if_unset(pose_args, "concurrency", 1, argv, "--concurrency")
+    _set_default_if_unset(
+        pose_args,
+        "faster_whisper_beam_size",
+        1,
+        argv,
+        "--faster-whisper-beam-size",
+        "FASTER_WHISPER_BEAM_SIZE",
+    )
+    _set_default_if_unset(
+        pose_args,
+        "faster_whisper_cpu_threads",
+        2,
+        argv,
+        "--faster-whisper-cpu-threads",
+        "FASTER_WHISPER_CPU_THREADS",
+    )
+    _set_default_if_unset(pose_args, "pose_render_fps", 16.0, argv, "--pose-render-fps", "POSE_RENDER_FPS")
+    _set_default_if_unset(
+        pose_args,
+        "interpolate",
+        False,
+        argv,
+        "--interpolate",
+        "--no-interpolate",
+        "POSE_INTERPOLATE",
+    )
+    _set_default_if_unset(pose_args, "playback_rate", 2.0, argv, "--playback-rate")
+
+    _set_default_if_unset(dashboard_args, "ui_fps", 6.0, argv, "--ui-fps")
+    _set_default_if_unset(dashboard_args, "event_poll_ms", 33, argv, "--event-poll-ms", "EVENT_POLL_MS")
+    _set_default_if_unset(
+        dashboard_args,
+        "camera_render_format",
+        "ppm",
+        argv,
+        "--camera-render-format",
+        "CAMERA_RENDER_FORMAT",
+    )
+    _set_default_if_unset(
+        dashboard_args,
+        "camera_display_max_width",
+        640,
+        argv,
+        "--camera-display-max-width",
+        "CAMERA_DISPLAY_MAX_WIDTH",
+    )
+    _set_default_if_unset(
+        dashboard_args,
+        "camera_display_max_height",
+        480,
+        argv,
+        "--camera-display-max-height",
+        "CAMERA_DISPLAY_MAX_HEIGHT",
+    )
+    _set_default_if_unset(dashboard_args, "overlay_alpha", 150, argv, "--overlay-alpha", "OVERLAY_ALPHA")
 
 
 def parse_dual_args(argv: list[str]) -> tuple[argparse.Namespace, argparse.Namespace, argparse.Namespace]:
@@ -334,7 +553,15 @@ def parse_dual_args(argv: list[str]) -> tuple[argparse.Namespace, argparse.Names
 
     dashboard_parser = build_dashboard_arg_parser()
     dashboard_args, remaining = dashboard_parser.parse_known_args(remaining)
+    apply_performance_profile_defaults(client_args, pose_args, dashboard_args, argv)
     dashboard_args.ui_fps = max(1.0, float(dashboard_args.ui_fps))
+    dashboard_args.event_poll_ms = max(8, int(dashboard_args.event_poll_ms))
+    dashboard_args.camera_render_format = str(dashboard_args.camera_render_format).strip().lower()
+    if dashboard_args.camera_render_format not in {"auto", "ppm", "png"}:
+        dashboard_parser.error("--camera-render-format must be auto, ppm, or png")
+    dashboard_args.camera_display_max_width = max(0, int(dashboard_args.camera_display_max_width))
+    dashboard_args.camera_display_max_height = max(0, int(dashboard_args.camera_display_max_height))
+    dashboard_args.overlay_alpha = max(0, min(255, int(dashboard_args.overlay_alpha)))
 
     if remaining:
         dashboard_parser.error(f"unrecognized arguments: {' '.join(remaining)}")
@@ -346,8 +573,9 @@ def parse_dual_args(argv: list[str]) -> tuple[argparse.Namespace, argparse.Names
 
 
 class TkEventBridge:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, *, poll_ms: int = 16):
         self.root = root
+        self.poll_ms = max(8, int(poll_ms))
         self.events: "queue.Queue[Callable[[], None]]" = queue.Queue()
         self.frame_lock = threading.Lock()
         self.latest_frame: Optional[tuple[np.ndarray, dict[str, object]]] = None
@@ -369,7 +597,7 @@ class TkEventBridge:
             self.latest_frame = (frame, snapshot)
 
     def start(self) -> None:
-        self.root.after(16, self.drain)
+        self.root.after(self.poll_ms, self.drain)
 
     def close(self) -> None:
         self.closed = True
@@ -401,12 +629,27 @@ class TkEventBridge:
                 self.close()
                 return
 
-        self.root.after(16, self.drain)
+        self.root.after(self.poll_ms, self.drain)
 
 
 class SignToSpeechPanel:
-    def __init__(self, parent: tk.Widget, *, mirror_camera: bool):
+    def __init__(
+        self,
+        parent: tk.Widget,
+        *,
+        mirror_camera: bool,
+        render_format: str,
+        display_max_width: int,
+        display_max_height: int,
+        overlay_alpha: int,
+    ):
         self.mirror_camera = mirror_camera
+        self.render_format = str(render_format or "auto").strip().lower()
+        if self.render_format not in {"auto", "ppm", "png"}:
+            self.render_format = "auto"
+        self.display_max_width = max(0, int(display_max_width))
+        self.display_max_height = max(0, int(display_max_height))
+        self.overlay_alpha = max(0, min(255, int(overlay_alpha)))
         self.photo: Optional[tk.PhotoImage] = None
         self.overlay_photo: Optional[tk.PhotoImage] = None
         self.overlay_photo_size: tuple[int, int] = (0, 0)
@@ -476,11 +719,15 @@ class SignToSpeechPanel:
             frame = cv2.flip(frame, 1)
         frame_h, frame_w = frame.shape[:2]
         scale = min(width / max(1, frame_w), height / max(1, frame_h))
+        if self.display_max_width > 0:
+            scale = min(scale, self.display_max_width / max(1, frame_w))
+        if self.display_max_height > 0:
+            scale = min(scale, self.display_max_height / max(1, frame_h))
         target_w = max(1, int(frame_w * scale))
         target_h = max(1, int(frame_h * scale))
         resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        ok, png = cv2.imencode(".png", resized)
-        if not ok:
+        self.photo = self._frame_to_photo(resized)
+        if self.photo is None:
             self.canvas.create_text(
                 width / 2,
                 height / 2,
@@ -489,10 +736,31 @@ class SignToSpeechPanel:
                 font=("Segoe UI", 13, "bold"),
             )
             return
-        encoded = base64.b64encode(png.tobytes()).decode("ascii")
-        self.photo = tk.PhotoImage(data=encoded, format="PNG")
         self.canvas.create_image(width / 2, height / 2, image=self.photo, anchor=tk.CENTER)
         self._draw_overlay(width, height)
+
+    def _frame_to_photo(self, frame_bgr: np.ndarray) -> Optional[tk.PhotoImage]:
+        if self.render_format in {"auto", "ppm"}:
+            try:
+                rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                rgb = np.ascontiguousarray(rgb)
+                height, width = rgb.shape[:2]
+                ppm = f"P6\n{width} {height}\n255\n".encode("ascii") + rgb.tobytes()
+                return tk.PhotoImage(data=ppm, format="PPM")
+            except tk.TclError as exc:
+                if self.render_format == "ppm":
+                    print(f"[ui] PPM camera render failed, falling back to PNG: {exc}")
+                self.render_format = "png"
+            except Exception as exc:
+                print(f"[ui] PPM camera render failed: {exc}")
+                if self.render_format == "ppm":
+                    self.render_format = "png"
+
+        ok, png = cv2.imencode(".png", frame_bgr)
+        if not ok:
+            return None
+        encoded = base64.b64encode(png.tobytes()).decode("ascii")
+        return tk.PhotoImage(data=encoded, format="PNG")
 
     def _draw_overlay(self, width: int, height: int) -> None:
         overlay_width = max(260, int(width * 0.92))
@@ -501,7 +769,7 @@ class SignToSpeechPanel:
         y = max(12, height - overlay_height - 22)
 
         if self.overlay_photo is None or self.overlay_photo_size != (overlay_width, overlay_height):
-            self.overlay_photo = make_translucent_overlay(overlay_width, overlay_height, alpha=178)
+            self.overlay_photo = make_translucent_overlay(overlay_width, overlay_height, alpha=self.overlay_alpha)
             self.overlay_photo_size = (overlay_width, overlay_height)
 
         self.canvas.create_image(x, y, image=self.overlay_photo, anchor=tk.NW)
@@ -1329,6 +1597,7 @@ class SpeechPosePanel:
         self.closed = False
         self.overlay_photo: Optional[tk.PhotoImage] = None
         self.overlay_photo_size: tuple[int, int] = (0, 0)
+        self.overlay_alpha = max(0, min(255, int(getattr(args, "overlay_alpha", 178))))
         self.current_overlay_text = "Listening..."
         self.next_overlay_text = "Waiting for speech"
         self.status_overlay_text = "ASR: Starting  |  API: Idle"
@@ -1430,7 +1699,7 @@ class SpeechPosePanel:
         y = max(12, height - overlay_height - 22)
 
         if self.overlay_photo is None or self.overlay_photo_size != (overlay_width, overlay_height):
-            self.overlay_photo = make_translucent_overlay(overlay_width, overlay_height, alpha=178)
+            self.overlay_photo = make_translucent_overlay(overlay_width, overlay_height, alpha=self.overlay_alpha)
             self.overlay_photo_size = (overlay_width, overlay_height)
 
         self.canvas.create_image(
@@ -1994,7 +2263,7 @@ class DualTranslatorDashboard:
             self.root.attributes("-fullscreen", True)
         self.root.configure(bg="#eef2f6")
 
-        self.bridge = TkEventBridge(self.root)
+        self.bridge = TkEventBridge(self.root, poll_ms=int(self.dashboard_args.event_poll_ms))
         self._build_ui()
         self.bridge.set_camera_handler(self.sign_panel.update_frame)
 
@@ -2009,6 +2278,7 @@ class DualTranslatorDashboard:
             name="ASLToEnglishRealtime",
             daemon=True,
         )
+        self.pose_args.overlay_alpha = self.dashboard_args.overlay_alpha
         self.pose_panel = SpeechPosePanel(self.root, self.main_area, self.pose_args, self.bridge)
 
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -2028,6 +2298,10 @@ class DualTranslatorDashboard:
         self.sign_panel = SignToSpeechPanel(
             self.main_area,
             mirror_camera=bool(self.dashboard_args.mirror_camera),
+            render_format=str(self.dashboard_args.camera_render_format),
+            display_max_width=int(self.dashboard_args.camera_display_max_width),
+            display_max_height=int(self.dashboard_args.camera_display_max_height),
+            overlay_alpha=int(self.dashboard_args.overlay_alpha),
         )
         divider = tk.Frame(self.main_area, bg="#0f172a", width=2)
         divider.place(relx=0.5, rely=0, relheight=1, anchor="n")
