@@ -57,7 +57,7 @@ import khoa as pose_client
 
 
 START_CLIENT_DEFAULT_SERVER_URL = (
-    "https://thanhhoang12032005--openslt-realtime-realtime-app.modal.run"
+    "https://thanhhoang12032005--openslt-realtime-realtime-app-dev.modal.run"
 )
 REMOTE_POSE_DEFAULT_SERVER_URL = (
     "https://lequanganhkhoa2005--speech-to-pose-server-api-dev.modal.run/speech-to-pose"
