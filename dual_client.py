@@ -822,6 +822,10 @@ class SignToSpeechPanel:
         )
 
 
+class NoSpeechDetected(RuntimeError):
+    pass
+
+
 class RemoteSpeechPoseClient:
     def __init__(
         self,
@@ -1136,6 +1140,9 @@ class RemoteSpeechPoseClient:
     def _request_worker(self, wav_bytes: bytes, reason: str) -> None:
         try:
             sequence = self._request_pose(wav_bytes)
+        except NoSpeechDetected:
+            self.on_status("Listening (remote pose)")
+            return
         except Exception as exc:
             self.on_status(f"Remote pose error: {exc}")
             print(f"[Remote Speech Pose] request failed ({reason}): {exc}", file=sys.stderr)
@@ -1175,9 +1182,23 @@ class RemoteSpeechPoseClient:
                 files={"audio": ("speech.wav", wav_bytes, "audio/wav")},
                 headers=headers,
                 timeout=self.timeout,
-            )
+        )
         http_ms = (time.perf_counter() - started_at) * 1000.0
+        if response.status_code == 204:
+            print(
+                "[Remote Speech Pose] no_speech "
+                f"http_ms={http_ms:.1f} "
+                f"server_total_ms={response.headers.get('X-Total-MS', '?')} "
+                f"asr_ms={response.headers.get('X-ASR-MS', '?')}"
+            )
+            raise NoSpeechDetected()
         if not response.ok:
+            if response.status_code == 422 and "ASR produced empty transcript" in response.text:
+                print(
+                    "[Remote Speech Pose] no_speech_legacy_422 "
+                    f"http_ms={http_ms:.1f}"
+                )
+                raise NoSpeechDetected()
             snippet = response.text[:300].strip()
             raise RuntimeError(f"HTTP {response.status_code}: {snippet}")
 
