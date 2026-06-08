@@ -220,30 +220,6 @@ def build_pose_arg_parser() -> argparse.ArgumentParser:
         help="Require this much voiced audio before sending a phrase to the server.",
     )
     parser.add_argument(
-        "--remote-speech-start-blocks",
-        type=int,
-        default=int(os.environ.get("REMOTE_SPEECH_START_BLOCKS", "2")),
-        help="Require this many consecutive voiced blocks before starting a phrase.",
-    )
-    parser.add_argument(
-        "--remote-min-peak-rms",
-        type=float,
-        default=float(os.environ.get("REMOTE_MIN_PEAK_RMS", "0.020")),
-        help="Drop phrases whose peak RMS is below this value.",
-    )
-    parser.add_argument(
-        "--remote-send-threshold-margin",
-        type=float,
-        default=float(os.environ.get("REMOTE_SEND_THRESHOLD_MARGIN", "1.35")),
-        help="Require phrase peak RMS to exceed the calibrated VAD threshold by this multiplier.",
-    )
-    parser.add_argument(
-        "--remote-min-voiced-ratio",
-        type=float,
-        default=float(os.environ.get("REMOTE_MIN_VOICED_RATIO", "0.25")),
-        help="Drop phrases if too little of the captured audio was voiced.",
-    )
-    parser.add_argument(
         "--remote-max-utterance-seconds",
         type=float,
         default=float(os.environ.get("REMOTE_MAX_UTTERANCE_SECONDS", "7.0")),
@@ -577,10 +553,6 @@ def parse_dual_args(argv: list[str]) -> tuple[argparse.Namespace, argparse.Names
     pose_args.remote_silence_seconds = max(0.2, float(pose_args.remote_silence_seconds))
     pose_args.remote_min_utterance_seconds = max(0.1, float(pose_args.remote_min_utterance_seconds))
     pose_args.remote_min_speech_seconds = max(0.05, float(pose_args.remote_min_speech_seconds))
-    pose_args.remote_speech_start_blocks = max(1, int(pose_args.remote_speech_start_blocks))
-    pose_args.remote_min_peak_rms = max(0.0, float(pose_args.remote_min_peak_rms))
-    pose_args.remote_send_threshold_margin = max(1.0, float(pose_args.remote_send_threshold_margin))
-    pose_args.remote_min_voiced_ratio = max(0.0, min(1.0, float(pose_args.remote_min_voiced_ratio)))
     pose_args.remote_max_utterance_seconds = max(1.0, float(pose_args.remote_max_utterance_seconds))
     pose_args.remote_noise_calibration_seconds = max(0.0, float(pose_args.remote_noise_calibration_seconds))
     pose_args.remote_audio_block_ms = max(40.0, float(pose_args.remote_audio_block_ms))
@@ -850,10 +822,6 @@ class SignToSpeechPanel:
         )
 
 
-class NoSpeechDetected(RuntimeError):
-    pass
-
-
 class RemoteSpeechPoseClient:
     def __init__(
         self,
@@ -865,10 +833,6 @@ class RemoteSpeechPoseClient:
         silence_seconds: float,
         min_utterance_seconds: float,
         min_speech_seconds: float,
-        speech_start_blocks: int,
-        min_peak_rms: float,
-        send_threshold_margin: float,
-        min_voiced_ratio: float,
         max_utterance_seconds: float,
         timeout: float,
         audio_block_ms: float,
@@ -887,10 +851,6 @@ class RemoteSpeechPoseClient:
         self.silence_seconds = max(0.2, float(silence_seconds))
         self.min_utterance_seconds = max(0.1, float(min_utterance_seconds))
         self.min_speech_seconds = max(0.05, float(min_speech_seconds))
-        self.speech_start_blocks = max(1, int(speech_start_blocks))
-        self.min_peak_rms = max(0.0, float(min_peak_rms))
-        self.send_threshold_margin = max(1.0, float(send_threshold_margin))
-        self.min_voiced_ratio = max(0.0, min(1.0, float(min_voiced_ratio)))
         self.max_utterance_seconds = max(1.0, float(max_utterance_seconds))
         self.timeout = max(1.0, float(timeout))
         self.audio_block_seconds = max(0.04, float(audio_block_ms) / 1000.0)
@@ -987,12 +947,10 @@ class RemoteSpeechPoseClient:
         phrase_voiced_samples = 0
         phrase_voiced_blocks = 0
         phrase_peak_rms = 0.0
-        speech_run_blocks = 0
 
         def flush_phrase(reason: str) -> None:
             nonlocal phrase_chunks, phrase_started_at, last_voice_at
             nonlocal phrase_voiced_samples, phrase_voiced_blocks, phrase_peak_rms
-            nonlocal speech_run_blocks
             if not phrase_chunks:
                 return
 
@@ -1007,27 +965,17 @@ class RemoteSpeechPoseClient:
             phrase_voiced_samples = 0
             phrase_voiced_blocks = 0
             phrase_peak_rms = 0.0
-            speech_run_blocks = 0
 
             duration = len(audio_i16) / max(1, self.sample_rate)
-            voiced_ratio = voiced_duration / max(duration, 0.001)
-            required_peak_rms = max(
-                self.min_peak_rms,
-                effective_vad_threshold * self.send_threshold_margin,
-            )
             if (
                 duration < self.min_utterance_seconds
                 or voiced_duration < self.min_speech_seconds
                 or voiced_blocks < required_voiced_blocks
-                or voiced_ratio < self.min_voiced_ratio
-                or peak_rms < required_peak_rms
             ):
                 print(
                     "[Remote Speech Pose] dropped_audio "
                     f"reason={reason} duration={duration:.2f}s voiced={voiced_duration:.2f}s "
-                    f"voiced_ratio={voiced_ratio:.2f} "
-                    f"voiced_blocks={voiced_blocks}/{required_voiced_blocks} "
-                    f"peak_rms={peak_rms:.4f} required_peak={required_peak_rms:.4f}"
+                    f"voiced_blocks={voiced_blocks}/{required_voiced_blocks} peak_rms={peak_rms:.4f}"
                 )
                 self.on_status("Listening (remote pose)")
                 return
@@ -1095,14 +1043,8 @@ class RemoteSpeechPoseClient:
                         continue
 
                     speaking = rms >= effective_vad_threshold
-                    if speaking:
-                        speech_run_blocks += 1
-                    else:
-                        speech_run_blocks = 0
 
                     if speaking and not phrase_chunks:
-                        if speech_run_blocks < self.speech_start_blocks:
-                            continue
                         phrase_started_at = now
                         self.on_interim("Listening...")
                     if speaking or phrase_chunks:
@@ -1194,9 +1136,6 @@ class RemoteSpeechPoseClient:
     def _request_worker(self, wav_bytes: bytes, reason: str) -> None:
         try:
             sequence = self._request_pose(wav_bytes)
-        except NoSpeechDetected:
-            self.on_status("Listening (remote pose)")
-            return
         except Exception as exc:
             self.on_status(f"Remote pose error: {exc}")
             print(f"[Remote Speech Pose] request failed ({reason}): {exc}", file=sys.stderr)
@@ -1236,16 +1175,8 @@ class RemoteSpeechPoseClient:
                 files={"audio": ("speech.wav", wav_bytes, "audio/wav")},
                 headers=headers,
                 timeout=self.timeout,
-        )
-        http_ms = (time.perf_counter() - started_at) * 1000.0
-        if response.status_code == 204:
-            print(
-                "[Remote Speech Pose] no_speech "
-                f"http_ms={http_ms:.1f} "
-                f"server_total_ms={response.headers.get('X-Total-MS', '?')} "
-                f"asr_ms={response.headers.get('X-ASR-MS', '?')}"
             )
-            raise NoSpeechDetected()
+        http_ms = (time.perf_counter() - started_at) * 1000.0
         if not response.ok:
             snippet = response.text[:300].strip()
             raise RuntimeError(f"HTTP {response.status_code}: {snippet}")
@@ -1367,10 +1298,6 @@ class SpeechPosePanel:
             silence_seconds=args.remote_silence_seconds,
             min_utterance_seconds=args.remote_min_utterance_seconds,
             min_speech_seconds=args.remote_min_speech_seconds,
-            speech_start_blocks=args.remote_speech_start_blocks,
-            min_peak_rms=args.remote_min_peak_rms,
-            send_threshold_margin=args.remote_send_threshold_margin,
-            min_voiced_ratio=args.remote_min_voiced_ratio,
             max_utterance_seconds=args.remote_max_utterance_seconds,
             timeout=args.remote_pose_timeout,
             audio_block_ms=args.remote_audio_block_ms,

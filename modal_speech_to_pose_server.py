@@ -377,24 +377,7 @@ def api():
 
         transcript = normalize_text(transcript)
         if not transcript:
-            total_ms = (time.perf_counter() - total_started_at) * 1000.0
-            print(
-                "[request] no_speech "
-                f"payload={payload_format} audio_kb={len(audio_bytes) / 1024.0:.1f} "
-                f"asr_ms={asr_ms:.1f} total_ms={total_ms:.1f}"
-            )
-            return Response(
-                status_code=204,
-                headers={
-                    "X-No-Speech": "1",
-                    "X-Audio-Bytes": str(len(audio_bytes)),
-                    "X-Payload-Format": payload_format,
-                    "X-ASR-MS": f"{asr_ms:.1f}",
-                    "X-Total-MS": f"{total_ms:.1f}",
-                    "Server-Timing": f"asr;dur={asr_ms:.1f}, total;dur={total_ms:.1f}",
-                    "Cache-Control": "no-store",
-                },
-            )
+            raise HTTPException(status_code=422, detail="ASR produced empty transcript")
 
         pose_started_at = time.perf_counter()
         pose_bytes, content_type, pose_cache_hit = fetch_pose(
