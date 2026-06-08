@@ -63,6 +63,8 @@ REMOTE_POSE_DEFAULT_SERVER_URL = (
     "https://lequanganhkhoa2005--speech-to-pose-server-api-dev.modal.run/speech-to-pose"
 )
 REMOTE_AUDIO_DEFAULT_SAMPLE_RATE = 48_000
+START_CLIENT_DEFAULT_REQUEST_TIMEOUT = 60.0
+START_CLIENT_DEFAULT_SERVER_STATS_INTERVAL = 1
 
 
 def parse_bool_env(value: str) -> bool:
@@ -175,6 +177,20 @@ def apply_start_client_env_defaults(args: argparse.Namespace, argv: list[str]) -
     for env_name, attr, enabled_option, disabled_option in bool_defaults:
         if env_name in os.environ and not option_provided(argv, enabled_option, disabled_option):
             setattr(args, attr, parse_bool_env(os.environ[env_name]))
+
+    if (
+        not option_provided(argv, "--request-timeout")
+        and "REQUEST_TIMEOUT" not in os.environ
+        and "OPENSLT_REQUEST_TIMEOUT" not in os.environ
+    ):
+        args.request_timeout = START_CLIENT_DEFAULT_REQUEST_TIMEOUT
+
+    if (
+        not option_provided(argv, "--server-stats-interval")
+        and "SERVER_STATS_INTERVAL" not in os.environ
+        and "OPENSLT_SERVER_STATS_INTERVAL" not in os.environ
+    ):
+        args.server_stats_interval = START_CLIENT_DEFAULT_SERVER_STATS_INTERVAL
 
 
 def build_pose_arg_parser() -> argparse.ArgumentParser:
@@ -371,87 +387,6 @@ def apply_performance_profile_defaults(
     argv: list[str],
 ) -> None:
     dashboard_args.profile = "pi"
-
-    _set_default_if_unset(client_args, "camera_fps", 15, argv, "--camera-fps", "CAMERA_FPS", "OPENSLT_CAMERA_FPS")
-    _set_default_if_unset(
-        client_args,
-        "camera_warmup_seconds",
-        0.8,
-        argv,
-        "--camera-warmup-seconds",
-        "CAMERA_WARMUP_SECONDS",
-        "OPENSLT_CAMERA_WARMUP_SECONDS",
-    )
-    _set_default_if_unset(client_args, "sample_fps", 8, argv, "--sample-fps", "SAMPLE_FPS", "OPENSLT_SAMPLE_FPS")
-    _set_default_if_unset(client_args, "chunk_frames", 8, argv, "--chunk-frames", "CHUNK_FRAMES", "OPENSLT_CHUNK_FRAMES")
-    _set_default_if_unset(client_args, "width", 480, argv, "--width", "FRAME_WIDTH", "OPENSLT_FRAME_WIDTH")
-    _set_default_if_unset(client_args, "height", 360, argv, "--height", "FRAME_HEIGHT", "OPENSLT_FRAME_HEIGHT")
-    _set_default_if_unset(
-        client_args,
-        "jpeg_quality",
-        55,
-        argv,
-        "--jpeg-quality",
-        "JPEG_QUALITY",
-        "OPENSLT_JPEG_QUALITY",
-    )
-    _set_default_if_unset(
-        client_args,
-        "upload_workers",
-        1,
-        argv,
-        "--upload-workers",
-        "UPLOAD_WORKERS",
-        "OPENSLT_UPLOAD_WORKERS",
-    )
-    _set_default_if_unset(
-        client_args,
-        "max_pending_uploads",
-        2,
-        argv,
-        "--max-pending-uploads",
-        "MAX_PENDING_UPLOADS",
-        "OPENSLT_MAX_PENDING_UPLOADS",
-    )
-    _set_default_if_unset(
-        client_args,
-        "server_stats_interval",
-        0,
-        argv,
-        "--server-stats-interval",
-        "SERVER_STATS_INTERVAL",
-        "OPENSLT_SERVER_STATS_INTERVAL",
-    )
-    _set_default_if_unset(
-        client_args,
-        "debug_timing",
-        False,
-        argv,
-        "--debug-timing",
-        "--no-debug-timing",
-        "DEBUG_TIMING",
-        "OPENSLT_DEBUG_TIMING",
-    )
-    _set_default_if_unset(
-        client_args,
-        "speech_debug",
-        False,
-        argv,
-        "--speech-debug",
-        "--no-speech-debug",
-        "SPEECH_DEBUG",
-        "OPENSLT_SPEECH_DEBUG",
-    )
-    _set_default_if_unset(
-        client_args,
-        "audio_cues",
-        False,
-        argv,
-        "--audio-cues",
-        "--no-audio-cues",
-        "AUDIO_CUES",
-        "OPENSLT_AUDIO_CUES",
-    )
 
     _set_default_if_unset(
         pose_args,
@@ -1635,47 +1570,6 @@ class DashboardRealtimeChunkClient(sign_client.RealtimeChunkClient):
         self.last_ui_frame_at = now
         self.bridge.post_camera_frame(frame.copy(), self.dashboard_snapshot())
 
-    def _connect_session_async(self) -> None:
-        try:
-            session_id = self._create_session_with_warmup()
-            if self.stop_event.is_set():
-                return
-            self.upload_executor = sign_client.concurrent.futures.ThreadPoolExecutor(
-                max_workers=self.upload_workers,
-                thread_name_prefix="chunk-sender",
-            )
-            self.session_id = session_id
-            print(f"[session] connected session_id={self.session_id}")
-            self._update_preview_state(status="Connected", detail=f"Session {self.session_id[:8]} ready")
-            self.audio_cues.play("session_ready", replace_current=True, priority=3)
-            self.speech_output.start()
-        except Exception as exc:
-            if self.stop_event.is_set():
-                return
-            print(f"[session] failed to create realtime session: {exc}")
-            self.audio_cues.play("network_down", replace_current=True, priority=3)
-            self.sender_error = str(exc)
-            self._update_preview_state(status="Session error", detail=str(exc))
-
-    def _create_session_with_warmup(self) -> str:
-        session_url = f"{self.base_url}/api/session"
-
-        while not self.stop_event.is_set():
-            response = self.session.post(session_url, timeout=self.args.request_timeout)
-            payload = self._safe_json(response)
-            session_id = payload.get("session_id")
-            if session_id:
-                return str(session_id)
-
-            status_label = payload.get("status_label") or payload.get("detail") or "runtime warming"
-            print(f"[session] {status_label}")
-            self._update_preview_state(status="Connecting", detail=status_label)
-            if response.status_code >= 400 and not payload.get("warming", False):
-                raise RuntimeError(status_label)
-            time.sleep(self.args.session_warmup_seconds)
-
-        raise RuntimeError("session creation interrupted")
-
     def run(self) -> None:
         self.audio_cues.start()
         self.publish_state()
@@ -1695,12 +1589,29 @@ class DashboardRealtimeChunkClient(sign_client.RealtimeChunkClient):
             self.session.close()
             return
 
-        session_thread = threading.Thread(
-            target=self._connect_session_async,
-            name="ASLToEnglishSession",
-            daemon=True,
+        try:
+            self.session_id = self._create_session_with_warmup()
+            print(f"[session] connected session_id={self.session_id}")
+            self._update_preview_state(status="Connected", detail=f"Session {self.session_id[:8]} ready")
+            self.audio_cues.play("session_ready", replace_current=True, priority=3)
+            self.speech_output.start()
+        except Exception as exc:
+            print(f"[session] failed to create realtime session: {exc}")
+            self.audio_cues.play("network_down", replace_current=True, priority=3)
+            self.sender_error = str(exc)
+            self._update_preview_state(status="Session error", detail=str(exc))
+            self.stop_event.set()
+            self._close_camera()
+            self._print_summary(finalize_remote=False)
+            self.speech_output.close()
+            self.audio_cues.close()
+            self.session.close()
+            return
+
+        self.upload_executor = sign_client.concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.upload_workers,
+            thread_name_prefix="chunk-sender",
         )
-        session_thread.start()
 
         current_chunk: list[bytes] = []
         current_chunk_start_ts_ms = 0.0
@@ -1742,12 +1653,7 @@ class DashboardRealtimeChunkClient(sign_client.RealtimeChunkClient):
                 resize_seconds_total += time.perf_counter() - resize_started_at
 
                 now = time.perf_counter()
-                upload_ready = (
-                    self.session_id is not None
-                    and self.upload_executor is not None
-                    and not self.sender_error
-                )
-                if upload_ready and now - last_sample_at >= self.sample_interval:
+                if now - last_sample_at >= self.sample_interval:
                     frame_brightness_mean, frame_brightness_std = self._compute_frame_diagnostics(frame)
                     encode_started_at = time.perf_counter()
                     encoded = self._encode_frame(frame)
@@ -1804,17 +1710,19 @@ class DashboardRealtimeChunkClient(sign_client.RealtimeChunkClient):
                 self.current_chunk_len = len(current_chunk)
                 self.publish_frame(frame)
 
+                if self.args.show_preview:
+                    preview = self._render_preview(frame, current_chunk_len=len(current_chunk))
+                    cv2.imshow("OpenSLT RPi Client", preview)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        self.stop_event.set()
+                        break
+
                 elapsed = time.perf_counter() - loop_start
                 sleep_seconds = max(0.0, (1.0 / max(self.args.camera_fps, 1)) - elapsed)
                 if sleep_seconds:
                     time.sleep(sleep_seconds)
 
-            if (
-                current_chunk
-                and self.session_id is not None
-                and self.upload_executor is not None
-                and not self.sender_error
-            ):
+            if current_chunk:
                 self._submit_chunk(
                     frame_bytes_list=current_chunk,
                     frame_sizes_bytes=chunk_frame_sizes,
@@ -1831,7 +1739,6 @@ class DashboardRealtimeChunkClient(sign_client.RealtimeChunkClient):
                 )
         finally:
             self.stop_event.set()
-            session_thread.join(timeout=1.0)
             uploads_drained = self._shutdown_uploads(
                 wait_seconds=min(max(5.0, self.args.request_timeout + 2.0), 30.0)
             )
@@ -1856,6 +1763,8 @@ class DualTranslatorDashboard:
         self.dashboard_args = dashboard_args
         self.started = False
         self.closing = False
+        self.close_started_at = 0.0
+        self.close_timeout_seconds = min(max(5.0, float(self.client_args.request_timeout) + 2.0), 30.0)
 
         self.root = tk.Tk()
         self.root.title("Bidirectional English / ASL Interpreter")
@@ -1925,13 +1834,25 @@ class DualTranslatorDashboard:
         if self.closing:
             return
         self.closing = True
+        self.close_started_at = time.perf_counter()
         self.stop()
         self.bridge.close()
+        self._finish_close_when_ready()
+
+    def _finish_close_when_ready(self) -> None:
+        if self.sign_thread.is_alive():
+            elapsed = time.perf_counter() - self.close_started_at
+            if elapsed < self.close_timeout_seconds:
+                self.root.after(100, self._finish_close_when_ready)
+                return
+            print(
+                "[dashboard] closing before Sign-to-Text thread fully stopped "
+                f"after {elapsed:.1f}s"
+            )
         try:
-            self.sign_thread.join(timeout=1.0)
-        except RuntimeError:
+            self.root.destroy()
+        except tk.TclError:
             pass
-        self.root.after(50, self.root.destroy)
 
     def run(self) -> None:
         if not self.dashboard_args.no_auto_start:
