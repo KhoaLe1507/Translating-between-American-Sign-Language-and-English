@@ -38,6 +38,15 @@ MODAL_MIN_CONTAINERS = int(os.environ.get("MODAL_MIN_CONTAINERS", "0"))
 MODAL_BUFFER_CONTAINERS = int(os.environ.get("MODAL_BUFFER_CONTAINERS", "0"))
 MODAL_SCALEDOWN_WINDOW = int(os.environ.get("MODAL_SCALEDOWN_WINDOW", "900"))
 WARM_ASR_MODEL = parse_bool_env(os.environ.get("WARM_ASR_MODEL", "1"))
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
+HF_TOKEN_SECRET_NAME = os.environ.get("HF_TOKEN_SECRET_NAME", "").strip()
+HF_TOKEN_SOURCE = "modal_secret" if HF_TOKEN_SECRET_NAME else "local_env" if HF_TOKEN else "none"
+CUDA_LIBRARY_PATH = (
+    "/usr/local/lib/python3.11/site-packages/nvidia/cublas/lib:"
+    "/usr/local/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:"
+    "/usr/local/lib/python3.11/site-packages/nvidia/cudnn/lib:"
+    "/usr/local/cuda/lib64"
+)
 
 runtime_env = {
     "ASR_MODEL": ASR_MODEL,
@@ -53,7 +62,9 @@ runtime_env = {
     "SIGN_MT_TIMEOUT": str(SIGN_MT_TIMEOUT),
     "POSE_TARGET_FPS": str(POSE_TARGET_FPS),
     "WARM_ASR_MODEL": "1" if WARM_ASR_MODEL else "0",
-    "HF_HUB_ENABLE_HF_TRANSFER": "1",
+    "HF_XET_HIGH_PERFORMANCE": "1",
+    "HF_TOKEN_SOURCE": HF_TOKEN_SOURCE,
+    "LD_LIBRARY_PATH": CUDA_LIBRARY_PATH,
 }
 
 
@@ -206,16 +217,27 @@ image = (
         "python-multipart",
         "requests",
         "faster-whisper",
-        "hf-transfer",
+        "hf-xet",
+        "nvidia-cublas-cu12",
+        "nvidia-cuda-runtime-cu12",
+        "nvidia-cudnn-cu12",
     )
+    .add_local_python_source("english_to_asl_gloss", copy=True)
     .env(runtime_env)
 )
 
 app = modal.App(APP_NAME, image=image)
 
+modal_secrets = []
+if HF_TOKEN_SECRET_NAME:
+    modal_secrets.append(modal.Secret.from_name(HF_TOKEN_SECRET_NAME, required_keys=["HF_TOKEN"]))
+elif HF_TOKEN:
+    modal_secrets.append(modal.Secret.from_dict({"HF_TOKEN": HF_TOKEN}))
+
 
 @app.function(
     image=image,
+    secrets=modal_secrets,
     gpu=ASR_GPU or None,
     cpu=MODAL_CPU,
     memory=MODAL_MEMORY,
@@ -229,6 +251,7 @@ def api():
     from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
     from fastapi.responses import JSONResponse, Response
     import requests
+    from english_to_asl_gloss import convert_english_to_asl
     from faster_whisper import WhisperModel
     from starlette.middleware.gzip import GZipMiddleware
 
@@ -242,6 +265,10 @@ def api():
 
     def normalize_text(text: str) -> str:
         return " ".join(str(text or "").strip().split())
+
+    def convert_to_asl_gloss(raw_text: str) -> str:
+        gloss = normalize_text(convert_english_to_asl(raw_text))
+        return gloss or raw_text
 
     def parse_timing_header(value: str) -> float:
         try:
@@ -366,6 +393,7 @@ def api():
     ):
         total_started_at = time.perf_counter()
         asr_ms = 0.0
+        gloss_ms = 0.0
         audio_bytes = audio_bytes or b""
         transcript = normalize_text(transcript)
         if not transcript:
@@ -381,7 +409,7 @@ def api():
             print(
                 "[request] no_speech "
                 f"payload={payload_format} audio_kb={len(audio_bytes) / 1024.0:.1f} "
-                f"asr_ms={asr_ms:.1f} total_ms={total_ms:.1f}"
+                f"asr_ms={asr_ms:.1f} gloss_ms={gloss_ms:.1f} total_ms={total_ms:.1f}"
             )
             return Response(
                 status_code=204,
@@ -390,15 +418,21 @@ def api():
                     "X-Audio-Bytes": str(len(audio_bytes)),
                     "X-Payload-Format": payload_format,
                     "X-ASR-MS": f"{asr_ms:.1f}",
+                    "X-Gloss-MS": f"{gloss_ms:.1f}",
                     "X-Total-MS": f"{total_ms:.1f}",
-                    "Server-Timing": f"asr;dur={asr_ms:.1f}, total;dur={total_ms:.1f}",
+                    "Server-Timing": f"asr;dur={asr_ms:.1f}, gloss;dur={gloss_ms:.1f}, total;dur={total_ms:.1f}",
                     "Cache-Control": "no-store",
                 },
             )
 
+        raw_transcript = transcript
+        gloss_started_at = time.perf_counter()
+        gloss_text = convert_to_asl_gloss(raw_transcript)
+        gloss_ms = (time.perf_counter() - gloss_started_at) * 1000.0
+
         pose_started_at = time.perf_counter()
         pose_bytes, content_type, pose_cache_hit = fetch_pose(
-            transcript,
+            gloss_text,
             spoken or SPOKEN_LANGUAGE,
             signed or SIGNED_LANGUAGE,
         )
@@ -408,19 +442,21 @@ def api():
         total_ms = (time.perf_counter() - total_started_at) * 1000.0
         print(
             "[request] "
-            f"text={transcript!r} payload={payload_format} "
+            f"raw_text={raw_transcript!r} gloss_text={gloss_text!r} payload={payload_format} "
             f"audio_kb={len(audio_bytes) / 1024.0:.1f} "
             f"pose_kb={len(pose_bytes) / 1024.0:.1f} "
             f"original_pose_kb={len(original_pose_bytes) / 1024.0:.1f} "
             f"downsample={downsample_info.get('reason')} "
             f"frames={downsample_info.get('original_frames', '?')}->{downsample_info.get('output_frames', '?')} "
             f"fps={float(downsample_info.get('original_fps', 0.0) or 0.0):.1f}->{float(downsample_info.get('output_fps', 0.0) or 0.0):.1f} "
-            f"asr_ms={asr_ms:.1f} pose_ms={pose_ms:.1f} total_ms={total_ms:.1f} "
+            f"asr_ms={asr_ms:.1f} gloss_ms={gloss_ms:.1f} pose_ms={pose_ms:.1f} total_ms={total_ms:.1f} "
             f"pose_cache={'hit' if pose_cache_hit else 'miss'}"
         )
 
         headers = {
-            "X-Transcript": transcript,
+            "X-Transcript": raw_transcript,
+            "X-Raw-Transcript": raw_transcript,
+            "X-ASL-Gloss": gloss_text,
             "X-Audio-Bytes": str(len(audio_bytes)),
             "X-Pose-Bytes": str(len(pose_bytes)),
             "X-Pose-Original-Bytes": str(len(original_pose_bytes)),
@@ -433,16 +469,19 @@ def api():
             "X-Pose-Target-FPS": f"{POSE_TARGET_FPS:.3f}",
             "X-Payload-Format": payload_format,
             "X-ASR-MS": f"{asr_ms:.1f}",
+            "X-Gloss-MS": f"{gloss_ms:.1f}",
             "X-Sign-MT-MS": f"{pose_ms:.1f}",
             "X-Total-MS": f"{total_ms:.1f}",
             "X-Pose-Cache": "hit" if pose_cache_hit else "miss",
-            "Server-Timing": f"asr;dur={asr_ms:.1f}, signmt;dur={pose_ms:.1f}, total;dur={total_ms:.1f}",
+            "Server-Timing": f"asr;dur={asr_ms:.1f}, gloss;dur={gloss_ms:.1f}, signmt;dur={pose_ms:.1f}, total;dur={total_ms:.1f}",
             "Cache-Control": "no-store",
         }
         if response_format == "json":
             return JSONResponse(
                 {
-                    "text": transcript,
+                    "text": raw_transcript,
+                    "raw_text": raw_transcript,
+                    "gloss_text": gloss_text,
                     "content_type": content_type,
                     "pose_base64": base64.b64encode(pose_bytes).decode("ascii"),
                 },
@@ -465,6 +504,11 @@ def api():
             "beam_size": ASR_BEAM_SIZE,
             "vad_filter": ASR_VAD_FILTER,
             "warm_model": WARM_ASR_MODEL,
+            "signmt_input": "asl_gloss",
+            "gloss_converter": "english_to_asl_gloss.convert_english_to_asl",
+            "hf_xet_high_performance": os.environ.get("HF_XET_HIGH_PERFORMANCE") == "1",
+            "hf_token_configured": bool(os.environ.get("HF_TOKEN")),
+            "hf_token_source": os.environ.get("HF_TOKEN_SOURCE", "none"),
         }
 
     @web.get("/")
