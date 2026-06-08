@@ -214,10 +214,22 @@ def build_pose_arg_parser() -> argparse.ArgumentParser:
         help="Ignore utterances shorter than this duration.",
     )
     parser.add_argument(
+        "--remote-min-speech-seconds",
+        type=float,
+        default=float(os.environ.get("REMOTE_MIN_SPEECH_SECONDS", "0.20")),
+        help="Require this much voiced audio before sending a phrase to the server.",
+    )
+    parser.add_argument(
         "--remote-max-utterance-seconds",
         type=float,
         default=float(os.environ.get("REMOTE_MAX_UTTERANCE_SECONDS", "7.0")),
         help="Force-finalize a long utterance after this duration.",
+    )
+    parser.add_argument(
+        "--remote-noise-calibration-seconds",
+        type=float,
+        default=float(os.environ.get("REMOTE_NOISE_CALIBRATION_SECONDS", "0.8")),
+        help="Measure initial microphone noise and raise the VAD threshold above that floor.",
     )
     parser.add_argument(
         "--remote-audio-block-ms",
@@ -540,7 +552,9 @@ def parse_dual_args(argv: list[str]) -> tuple[argparse.Namespace, argparse.Names
     pose_args.remote_vad_threshold = max(0.001, float(pose_args.remote_vad_threshold))
     pose_args.remote_silence_seconds = max(0.2, float(pose_args.remote_silence_seconds))
     pose_args.remote_min_utterance_seconds = max(0.1, float(pose_args.remote_min_utterance_seconds))
+    pose_args.remote_min_speech_seconds = max(0.05, float(pose_args.remote_min_speech_seconds))
     pose_args.remote_max_utterance_seconds = max(1.0, float(pose_args.remote_max_utterance_seconds))
+    pose_args.remote_noise_calibration_seconds = max(0.0, float(pose_args.remote_noise_calibration_seconds))
     pose_args.remote_audio_block_ms = max(40.0, float(pose_args.remote_audio_block_ms))
     pose_args.remote_audio_latency = str(pose_args.remote_audio_latency).strip().lower() or "low"
     pose_args.remote_max_pending_requests = max(1, int(pose_args.remote_max_pending_requests))
@@ -818,10 +832,12 @@ class RemoteSpeechPoseClient:
         vad_threshold: float,
         silence_seconds: float,
         min_utterance_seconds: float,
+        min_speech_seconds: float,
         max_utterance_seconds: float,
         timeout: float,
         audio_block_ms: float,
         audio_latency: str,
+        noise_calibration_seconds: float,
         max_pending_requests: int,
         upload_format: str,
         on_pose: Callable[[pose_client.PoseSequence], None],
@@ -834,10 +850,12 @@ class RemoteSpeechPoseClient:
         self.vad_threshold = max(0.001, float(vad_threshold))
         self.silence_seconds = max(0.2, float(silence_seconds))
         self.min_utterance_seconds = max(0.1, float(min_utterance_seconds))
+        self.min_speech_seconds = max(0.05, float(min_speech_seconds))
         self.max_utterance_seconds = max(1.0, float(max_utterance_seconds))
         self.timeout = max(1.0, float(timeout))
         self.audio_block_seconds = max(0.04, float(audio_block_ms) / 1000.0)
         self.audio_latency = str(audio_latency or "low").strip().lower() or "low"
+        self.noise_calibration_seconds = max(0.0, float(noise_calibration_seconds))
         self.max_pending_requests = max(1, int(max_pending_requests))
         self.upload_format = str(upload_format or "raw").strip().lower()
         if self.upload_format not in {"raw", "multipart"}:
@@ -887,6 +905,23 @@ class RemoteSpeechPoseClient:
             self.on_status(f"Install sounddevice to send microphone audio. ({exc})")
             return
 
+        try:
+            input_device = sd.query_devices(kind="input")
+            input_channels = int(input_device.get("max_input_channels", 0))
+            input_name = str(input_device.get("name", "default input"))
+            if input_channels < 1:
+                self.on_status("No microphone input device detected")
+                print(f"[Remote Speech Pose] no input channels on device: {input_device}", file=sys.stderr)
+                return
+            print(
+                "[Remote Speech Pose] input_device "
+                f"name={input_name!r} channels={input_channels} sample_rate={self.sample_rate}"
+            )
+        except Exception as exc:
+            self.on_status(f"No microphone input device detected. ({exc})")
+            print(f"[Remote Speech Pose] input device check failed: {exc}", file=sys.stderr)
+            return
+
         blocksize = max(256, int(self.sample_rate * self.audio_block_seconds))
         queue_size = max(10, int(2.0 / self.audio_block_seconds))
         audio_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=queue_size)
@@ -909,9 +944,13 @@ class RemoteSpeechPoseClient:
         phrase_chunks: list[np.ndarray] = []
         phrase_started_at = 0.0
         last_voice_at = 0.0
+        phrase_voiced_samples = 0
+        phrase_voiced_blocks = 0
+        phrase_peak_rms = 0.0
 
         def flush_phrase(reason: str) -> None:
             nonlocal phrase_chunks, phrase_started_at, last_voice_at
+            nonlocal phrase_voiced_samples, phrase_voiced_blocks, phrase_peak_rms
             if not phrase_chunks:
                 return
 
@@ -919,9 +958,25 @@ class RemoteSpeechPoseClient:
             phrase_chunks = []
             phrase_started_at = 0.0
             last_voice_at = 0.0
+            voiced_duration = phrase_voiced_samples / max(1, self.sample_rate)
+            required_voiced_blocks = max(1, int((self.min_speech_seconds / self.audio_block_seconds) + 0.999))
+            voiced_blocks = phrase_voiced_blocks
+            peak_rms = phrase_peak_rms
+            phrase_voiced_samples = 0
+            phrase_voiced_blocks = 0
+            phrase_peak_rms = 0.0
 
             duration = len(audio_i16) / max(1, self.sample_rate)
-            if duration < self.min_utterance_seconds:
+            if (
+                duration < self.min_utterance_seconds
+                or voiced_duration < self.min_speech_seconds
+                or voiced_blocks < required_voiced_blocks
+            ):
+                print(
+                    "[Remote Speech Pose] dropped_audio "
+                    f"reason={reason} duration={duration:.2f}s voiced={voiced_duration:.2f}s "
+                    f"voiced_blocks={voiced_blocks}/{required_voiced_blocks} peak_rms={peak_rms:.4f}"
+                )
                 self.on_status("Listening (remote pose)")
                 return
 
@@ -931,7 +986,14 @@ class RemoteSpeechPoseClient:
 
         try:
             self.active = True
-            self.on_status("Listening (remote pose)")
+            effective_vad_threshold = self.vad_threshold
+            calibration_values: list[float] = []
+            calibration_started_at = time.perf_counter()
+            calibrated = self.noise_calibration_seconds <= 0.0
+            if calibrated:
+                self.on_status("Listening (remote pose)")
+            else:
+                self.on_status("Calibrating microphone noise")
             with sd.RawInputStream(
                 samplerate=self.sample_rate,
                 blocksize=blocksize,
@@ -958,7 +1020,29 @@ class RemoteSpeechPoseClient:
                     samples_f32 = samples_i16.astype(np.float32) / 32768.0
                     rms = float(np.sqrt(np.mean(np.square(samples_f32))))
                     now = time.perf_counter()
-                    speaking = rms >= self.vad_threshold
+
+                    if not calibrated:
+                        calibration_values.append(rms)
+                        if now - calibration_started_at < self.noise_calibration_seconds:
+                            continue
+                        if calibration_values:
+                            noise_mean = float(np.mean(calibration_values))
+                            noise_p95 = float(np.percentile(calibration_values, 95))
+                            effective_vad_threshold = max(
+                                self.vad_threshold,
+                                noise_mean * 3.0,
+                                noise_p95 * 1.8,
+                            )
+                            print(
+                                "[Remote Speech Pose] noise_calibration "
+                                f"mean={noise_mean:.4f} p95={noise_p95:.4f} "
+                                f"threshold={effective_vad_threshold:.4f}"
+                            )
+                        calibrated = True
+                        self.on_status("Listening (remote pose)")
+                        continue
+
+                    speaking = rms >= effective_vad_threshold
 
                     if speaking and not phrase_chunks:
                         phrase_started_at = now
@@ -967,6 +1051,9 @@ class RemoteSpeechPoseClient:
                         phrase_chunks.append(samples_i16.copy())
                     if speaking:
                         last_voice_at = now
+                        phrase_voiced_samples += samples_i16.size
+                        phrase_voiced_blocks += 1
+                        phrase_peak_rms = max(phrase_peak_rms, rms)
 
                     phrase_age = now - phrase_started_at if phrase_started_at else 0.0
                     silence_age = now - last_voice_at if last_voice_at else 0.0
@@ -1210,10 +1297,12 @@ class SpeechPosePanel:
             vad_threshold=args.remote_vad_threshold,
             silence_seconds=args.remote_silence_seconds,
             min_utterance_seconds=args.remote_min_utterance_seconds,
+            min_speech_seconds=args.remote_min_speech_seconds,
             max_utterance_seconds=args.remote_max_utterance_seconds,
             timeout=args.remote_pose_timeout,
             audio_block_ms=args.remote_audio_block_ms,
             audio_latency=args.remote_audio_latency,
+            noise_calibration_seconds=args.remote_noise_calibration_seconds,
             max_pending_requests=args.remote_max_pending_requests,
             upload_format=args.remote_pose_upload_format,
             on_pose=lambda sequence: self.safe_after(lambda: self.enqueue_pose_sequence(sequence, "remote-speech")),

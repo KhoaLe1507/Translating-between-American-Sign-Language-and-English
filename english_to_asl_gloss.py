@@ -19,6 +19,7 @@ ASL gloss rules:
     prepositions are removed when they do not carry useful ASL gloss meaning.
   - Yes/No questions keep statement-like order, repeat the subject at the end,
     and end with '?'.
+  - Statement-style questions keep '?' but do not repeat the subject.
   - WH questions move the WH sign to the end and end with '?'.
   - The common phrase "How are you?" is kept as "HOW YOU?".
   - The common response "I'm fine" is kept as "ME FINE ME.".
@@ -96,7 +97,6 @@ ARTICLE_WORDS = {"a", "an", "the"}
 DROP_WORDS = {
     *ARTICLE_WORDS,
     *BE_FORMS,
-    *DO_FORMS,
     "about",
     "as",
     "at",
@@ -342,6 +342,7 @@ def convert_sentence(raw_sentence: str, tokens: list[str], terminal: str) -> Con
     time_tokens, core_tokens = extract_time_phrase(tokens_without_wh)
     core_tokens, leading_markers, tail_markers = handle_auxiliary_order(core_tokens, sentence_type, bool(time_tokens))
     yes_no_subject = extract_yes_no_subject(core_tokens) if sentence_type == "yes_no_question" else []
+    core_tokens = remove_auxiliary_do_before_negation(core_tokens)
     core_tokens, negation_markers = move_negation_to_end(core_tokens)
 
     core_gloss = normalize_core_tokens(core_tokens)
@@ -358,7 +359,7 @@ def convert_sentence(raw_sentence: str, tokens: list[str], terminal: str) -> Con
 
     gloss_tokens = dedupe_adjacent(gloss_tokens)
     gloss_tokens.extend(yes_no_subject)
-    punctuation = "?" if sentence_type in {"yes_no_question", "wh_question"} else "."
+    punctuation = "?" if sentence_type in {"yes_no_question", "wh_question", "statement_question"} else "."
     gloss = " ".join(gloss_tokens).strip()
     if gloss:
         gloss = f"{gloss}{punctuation}"
@@ -396,8 +397,10 @@ def classify_sentence(tokens: list[str], terminal: str) -> str:
     has_wh = find_wh(lowered) is not None
     if has_wh and (terminal == "?" or lowered[0] in WH_WORDS):
         return "wh_question"
-    if terminal == "?" or (lowered and lowered[0] in QUESTION_STARTERS):
+    if lowered and lowered[0] in QUESTION_STARTERS:
         return "yes_no_question"
+    if terminal == "?":
+        return "statement_question"
     return "statement"
 
 
@@ -589,6 +592,17 @@ def move_negation_to_end(tokens: list[str]) -> tuple[list[str], list[str]]:
     return kept, dedupe_adjacent(negation_markers)
 
 
+def remove_auxiliary_do_before_negation(tokens: list[str]) -> list[str]:
+    lowered = [token.lower() for token in tokens]
+    kept: list[str] = []
+    for index, token in enumerate(tokens):
+        next_word = lowered[index + 1] if index + 1 < len(lowered) else ""
+        if token.lower() in DO_FORMS and next_word in NEGATION_WORDS:
+            continue
+        kept.append(token)
+    return kept
+
+
 def extract_yes_no_subject(tokens: list[str]) -> list[str]:
     index = 0
     while index < len(tokens) and tokens[index].lower() in ARTICLE_WORDS | NEGATION_WORDS:
@@ -614,9 +628,12 @@ def extract_yes_no_subject(tokens: list[str]) -> list[str]:
 
 def normalize_core_tokens(tokens: list[str], *, drop_function_words: bool = True) -> list[str]:
     gloss_tokens: list[str] = []
-    for token in tokens:
+    lowered_tokens = [token.lower() for token in tokens]
+    for index, token in enumerate(tokens):
         lowered = token.lower()
         if lowered in FUTURE_AUX:
+            continue
+        if drop_function_words and lowered in DO_FORMS and looks_like_auxiliary_do(lowered_tokens, index):
             continue
         if drop_function_words and lowered in DROP_WORDS:
             continue
@@ -626,6 +643,13 @@ def normalize_core_tokens(tokens: list[str], *, drop_function_words: bool = True
         if gloss:
             gloss_tokens.append(gloss)
     return dedupe_adjacent(gloss_tokens)
+
+
+def looks_like_auxiliary_do(lowered_tokens: list[str], index: int) -> bool:
+    if index == 0:
+        return True
+    next_word = lowered_tokens[index + 1] if index + 1 < len(lowered_tokens) else ""
+    return next_word in NEGATION_WORDS
 
 
 def looks_like_auxiliary_have(word: str, tokens: list[str]) -> bool:
@@ -690,6 +714,7 @@ EXAMPLES: tuple[tuple[str, str], ...] = (
     ("I am happy today.", "TODAY ME HAPPY."),
     ("The boy went to the park yesterday.", "YESTERDAY BOY GO PARK."),
     ("Do you want water?", "YOU WANT WATER YOU?"),
+    ("Do you go to school?", "YOU GO SCHOOL YOU?"),
     ("Are you a student?", "YOU STUDENT YOU?"),
     ("Can you help me?", "YOU HELP ME CAN YOU?"),
     ("Where do you live?", "YOU LIVE WHERE?"),
@@ -700,6 +725,7 @@ EXAMPLES: tuple[tuple[str, str], ...] = (
     ("What is your name?", "YOUR NAME WHAT?"),
     ("Why are you late?", "YOU LATE WHY?"),
     ("I will meet my friend tomorrow.", "TOMORROW ME MEET MY FRIEND."),
+    ("I do my homework?", "ME DO MY HOMEWORK?"),
     ("I do not like coffee.", "ME LIKE COFFEE NOT."),
 )
 
