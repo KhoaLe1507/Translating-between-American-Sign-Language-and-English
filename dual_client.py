@@ -214,7 +214,7 @@ def build_pose_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--remote-vad-threshold",
         type=float,
-        default=float(os.environ.get("REMOTE_VAD_THRESHOLD", "0.012")),
+        default=float(os.environ.get("REMOTE_VAD_THRESHOLD", "0.02")),
         help="RMS threshold that marks microphone audio as speech.",
     )
     parser.add_argument(

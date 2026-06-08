@@ -86,8 +86,9 @@ CONTRACTIONS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
 )
 
 
-WORD_RE = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)?|\d+(?::\d+)?(?:am|pm)?|[.!?]", re.I)
+WORD_RE = re.compile(r"[A-Za-z]+(?:-[A-Za-z]+)*|\d+(?::\d+)?(?:am|pm)?|[.!?]", re.I)
 SENTENCE_RE = re.compile(r"[^.!?]+[.!?]?")
+FINGERSPELL_PREFIX = "__FS_"
 
 BE_FORMS = {"am", "m", "is", "are", "was", "were", "be", "been", "being"}
 DO_FORMS = {"do", "does", "did"}
@@ -377,7 +378,18 @@ def tokenize(sentence: str) -> tuple[list[str], str]:
     if pieces and pieces[-1] in ".!?":
         terminal = "?" if pieces[-1] == "?" else "."
         pieces = pieces[:-1]
-    return pieces, terminal
+    return expand_fingerspelled_tokens(pieces), terminal
+
+
+def expand_fingerspelled_tokens(tokens: list[str]) -> list[str]:
+    expanded: list[str] = []
+    for token in tokens:
+        parts = token.split("-")
+        if len(parts) > 1 and all(len(part) == 1 and part.isalpha() for part in parts):
+            expanded.extend(f"{FINGERSPELL_PREFIX}{part.upper()}" for part in parts)
+        else:
+            expanded.append(token)
+    return expanded
 
 
 def normalize_text(text: str) -> str:
@@ -667,6 +679,8 @@ def looks_like_auxiliary_have(word: str, tokens: list[str]) -> bool:
 def normalize_gloss_word(word: str) -> str:
     if not word:
         return ""
+    if word.startswith(FINGERSPELL_PREFIX.lower()):
+        return word.removeprefix(FINGERSPELL_PREFIX.lower()).upper()
     if word in PRONOUN_GLOSS:
         return PRONOUN_GLOSS[word]
     if re.fullmatch(r"\d+(?::\d+)?(am|pm)?", word, re.I):
@@ -723,6 +737,7 @@ EXAMPLES: tuple[tuple[str, str], ...] = (
     ("I ' m fine.", "ME FINE ME."),
     ("I ' m happy.", "ME HAPPY."),
     ("What is your name?", "YOUR NAME WHAT?"),
+    ("My name is K-H-O-A.", "MY NAME K H O A."),
     ("Why are you late?", "YOU LATE WHY?"),
     ("I will meet my friend tomorrow.", "TOMORROW ME MEET MY FRIEND."),
     ("I do my homework?", "ME DO MY HOMEWORK?"),
