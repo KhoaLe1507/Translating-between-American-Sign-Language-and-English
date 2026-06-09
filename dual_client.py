@@ -65,8 +65,8 @@ REMOTE_POSE_DEFAULT_SERVER_URL = (
 REMOTE_AUDIO_DEFAULT_SAMPLE_RATE = 48_000
 REMOTE_MIC_DEVICE_DEFAULT = "hw:4,0"
 START_CLIENT_DEFAULT_CHUNK_FRAMES = 10
-START_CLIENT_DEFAULT_UPLOAD_WORKERS = 5
-START_CLIENT_DEFAULT_MAX_PENDING_UPLOADS = 0
+START_CLIENT_DEFAULT_UPLOAD_WORKERS = 3
+START_CLIENT_DEFAULT_MAX_PENDING_UPLOADS = 20
 START_CLIENT_DEFAULT_REQUEST_TIMEOUT = 60.0
 START_CLIENT_DEFAULT_SERVER_STATS_INTERVAL = 0
 SIGN_CAMERA_OPEN_RETRIES = int(os.environ.get("SIGN_CAMERA_OPEN_RETRIES", "5"))
@@ -243,7 +243,7 @@ def build_pose_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--remote-vad-threshold",
         type=float,
-        default=0.02,
+        default=0.05,
         help="RMS threshold that marks microphone audio as speech.",
     )
     parser.add_argument(
