@@ -63,9 +63,12 @@ REMOTE_POSE_DEFAULT_SERVER_URL = (
     "https://lequanganhkhoa2005--speech-to-pose-server-api-dev.modal.run/speech-to-pose"
 )
 REMOTE_AUDIO_DEFAULT_SAMPLE_RATE = 48_000
-REMOTE_MIC_DEVICE_DEFAULT = "hw:4,0"
+REMOTE_MIC_DEVICE_DEFAULT = "Microphone (BY-V)"
+START_CLIENT_DEFAULT_CHUNK_FRAMES = 10
+START_CLIENT_DEFAULT_UPLOAD_WORKERS = 5
+START_CLIENT_DEFAULT_MAX_PENDING_UPLOADS = 0
 START_CLIENT_DEFAULT_REQUEST_TIMEOUT = 60.0
-START_CLIENT_DEFAULT_SERVER_STATS_INTERVAL = 1
+START_CLIENT_DEFAULT_SERVER_STATS_INTERVAL = 0
 
 
 def parse_bool_env(value: str) -> bool:
@@ -161,6 +164,27 @@ def apply_start_client_env_defaults(args: argparse.Namespace, argv: list[str]) -
     for env_name, attr, caster, option in env_defaults:
         if env_name in os.environ and not option_provided(argv, option):
             setattr(args, attr, caster(os.environ[env_name]))
+
+    if (
+        not option_provided(argv, "--chunk-frames")
+        and "CHUNK_FRAMES" not in os.environ
+        and "OPENSLT_CHUNK_FRAMES" not in os.environ
+    ):
+        args.chunk_frames = START_CLIENT_DEFAULT_CHUNK_FRAMES
+
+    if (
+        not option_provided(argv, "--upload-workers")
+        and "UPLOAD_WORKERS" not in os.environ
+        and "OPENSLT_UPLOAD_WORKERS" not in os.environ
+    ):
+        args.upload_workers = START_CLIENT_DEFAULT_UPLOAD_WORKERS
+
+    if (
+        not option_provided(argv, "--max-pending-uploads")
+        and "MAX_PENDING_UPLOADS" not in os.environ
+        and "OPENSLT_MAX_PENDING_UPLOADS" not in os.environ
+    ):
+        args.max_pending_uploads = START_CLIENT_DEFAULT_MAX_PENDING_UPLOADS
 
     bool_defaults: list[tuple[str, str, str, str]] = [
         ("DEBUG_TIMING", "debug_timing", "--debug-timing", "--no-debug-timing"),
@@ -693,7 +717,10 @@ class SignToSpeechPanel:
                 font=("Segoe UI", 13, "bold"),
             )
             return
+        image_x = (width - target_w) / 2
+        image_y = (height - target_h) / 2
         self.canvas.create_image(width / 2, height / 2, image=self.photo, anchor=tk.CENTER)
+        self._draw_signing_guide(image_x, image_y, target_w, target_h)
         self._draw_overlay(width, height)
 
     def _frame_to_photo(self, frame_bgr: np.ndarray) -> Optional[tk.PhotoImage]:
@@ -718,6 +745,79 @@ class SignToSpeechPanel:
             return None
         encoded = base64.b64encode(png.tobytes()).decode("ascii")
         return tk.PhotoImage(data=encoded, format="PNG")
+
+    def _draw_signing_guide(self, image_x: float, image_y: float, image_w: int, image_h: int) -> None:
+        if image_w <= 40 or image_h <= 40:
+            return
+
+        def px(rx: float) -> float:
+            return image_x + image_w * rx
+
+        def py(ry: float) -> float:
+            return image_y + image_h * ry
+
+        status = str(self.last_snapshot.get("status") or "").strip().lower()
+        draft = str(self.last_snapshot.get("draft") or "")
+        final = str(self.last_snapshot.get("final") or "")
+        active = status in {"listening", "streaming", "waiting", "collecting"} and not draft and not final
+        guide_color = "#4ade80" if active else "#86efac"
+        muted_color = "#cbd5e1"
+
+        zone_x0 = px(0.26)
+        zone_y0 = py(0.43)
+        zone_x1 = px(0.74)
+        zone_y1 = py(0.85)
+        self.canvas.create_rectangle(
+            zone_x0,
+            zone_y0,
+            zone_x1,
+            zone_y1,
+            outline=guide_color,
+            width=2,
+            dash=(8, 6),
+        )
+
+        corner = min(image_w, image_h) * 0.055
+        for x0, y0, sx, sy in (
+            (zone_x0, zone_y0, 1, 1),
+            (zone_x1, zone_y0, -1, 1),
+            (zone_x0, zone_y1, 1, -1),
+            (zone_x1, zone_y1, -1, -1),
+        ):
+            self.canvas.create_line(x0, y0, x0 + sx * corner, y0, fill=guide_color, width=4)
+            self.canvas.create_line(x0, y0, x0, y0 + sy * corner, fill=guide_color, width=4)
+
+        head_cx = px(0.50)
+        head_cy = py(0.19)
+        head_r = min(image_w, image_h) * 0.095
+        self.canvas.create_oval(
+            head_cx - head_r,
+            head_cy - head_r,
+            head_cx + head_r,
+            head_cy + head_r,
+            outline=muted_color,
+            width=1,
+            dash=(5, 5),
+        )
+        self.canvas.create_arc(
+            px(0.27),
+            py(0.20),
+            px(0.73),
+            py(0.47),
+            start=20,
+            extent=140,
+            style=tk.ARC,
+            outline=muted_color,
+            width=1,
+        )
+        self.canvas.create_text(
+            (zone_x0 + zone_x1) / 2,
+            zone_y0 + 18,
+            text="SIGN ZONE",
+            fill=guide_color,
+            font=("Segoe UI", 9, "bold"),
+            anchor=tk.CENTER,
+        )
 
     def _draw_overlay(self, width: int, height: int) -> None:
         overlay_width = max(260, int(width * 0.92))
@@ -1643,6 +1743,15 @@ class DashboardRealtimeChunkClient(sign_client.RealtimeChunkClient):
     def run(self) -> None:
         self.audio_cues.start()
         self.publish_state()
+        print(
+            "[Sign To Text] config "
+            f"base_url={self.base_url} camera_index={self.args.camera_index} "
+            f"size={self.args.width}x{self.args.height} sample_fps={self.args.sample_fps} "
+            f"chunk_frames={self.args.chunk_frames} upload_workers={self.upload_workers} "
+            f"max_pending={self.args.max_pending_uploads} endpoint={self.chunk_endpoint} "
+            f"request_timeout={self.args.request_timeout} "
+            f"server_stats_interval={self.args.server_stats_interval}"
+        )
         try:
             self._open_camera()
         except Exception as exc:
