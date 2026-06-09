@@ -57,7 +57,7 @@ import khoa as pose_client
 
 
 START_CLIENT_DEFAULT_SERVER_URL = (
-    "https://thanhhoang12032005--openslt-realtime-realtime-app-dev.modal.run"
+    "https://thanhhoang12032005--openslt-realtime-realtime-app.modal.run"
 )
 REMOTE_POSE_DEFAULT_SERVER_URL = (
     "https://lequanganhkhoa2005--speech-to-pose-server-api-dev.modal.run/speech-to-pose"
@@ -214,7 +214,7 @@ def build_pose_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--remote-vad-threshold",
         type=float,
-        default=float(os.environ.get("REMOTE_VAD_THRESHOLD", "0.012")),
+        default=0.012,
         help="RMS threshold that marks microphone audio as speech.",
     )
     parser.add_argument(
