@@ -63,12 +63,16 @@ REMOTE_POSE_DEFAULT_SERVER_URL = (
     "https://lequanganhkhoa2005--speech-to-pose-server-api-dev.modal.run/speech-to-pose"
 )
 REMOTE_AUDIO_DEFAULT_SAMPLE_RATE = 48_000
-REMOTE_MIC_DEVICE_DEFAULT = "Microphone (BY-V)"
+REMOTE_MIC_DEVICE_DEFAULT = "hw:4,0"
 START_CLIENT_DEFAULT_CHUNK_FRAMES = 10
 START_CLIENT_DEFAULT_UPLOAD_WORKERS = 5
 START_CLIENT_DEFAULT_MAX_PENDING_UPLOADS = 0
 START_CLIENT_DEFAULT_REQUEST_TIMEOUT = 60.0
 START_CLIENT_DEFAULT_SERVER_STATS_INTERVAL = 0
+SIGN_CAMERA_OPEN_RETRIES = int(os.environ.get("SIGN_CAMERA_OPEN_RETRIES", "5"))
+SIGN_CAMERA_READ_RETRIES = int(os.environ.get("SIGN_CAMERA_READ_RETRIES", "10"))
+SIGN_CAMERA_REOPEN_AFTER_READ_FAILURES = int(os.environ.get("SIGN_CAMERA_REOPEN_AFTER_READ_FAILURES", "3"))
+SIGN_CAMERA_RETRY_DELAY_SECONDS = float(os.environ.get("SIGN_CAMERA_RETRY_DELAY_SECONDS", "0.35"))
 
 
 def parse_bool_env(value: str) -> bool:
@@ -239,7 +243,7 @@ def build_pose_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--remote-vad-threshold",
         type=float,
-        default=0.012,
+        default=0.02,
         help="RMS threshold that marks microphone audio as speech.",
     )
     parser.add_argument(
@@ -1697,6 +1701,10 @@ class DashboardRealtimeChunkClient(sign_client.RealtimeChunkClient):
         self.ui_frame_interval = 1.0 / max(1.0, float(ui_fps))
         self.last_ui_frame_at = 0.0
         self.current_chunk_len = 0
+        self.camera_open_retries = max(1, SIGN_CAMERA_OPEN_RETRIES)
+        self.camera_read_retries = max(1, SIGN_CAMERA_READ_RETRIES)
+        self.camera_reopen_after_read_failures = max(1, SIGN_CAMERA_REOPEN_AFTER_READ_FAILURES)
+        self.camera_retry_delay_seconds = max(0.05, SIGN_CAMERA_RETRY_DELAY_SECONDS)
 
     def _update_preview_state(
         self,
@@ -1740,6 +1748,73 @@ class DashboardRealtimeChunkClient(sign_client.RealtimeChunkClient):
         self.last_ui_frame_at = now
         self.bridge.post_camera_frame(frame.copy(), self.dashboard_snapshot())
 
+    def _open_camera_with_retries(self, *, reason: str) -> bool:
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.camera_open_retries + 1):
+            if self.stop_event.is_set():
+                return False
+            try:
+                self._open_camera()
+                self.sender_error = None
+                if attempt > 1:
+                    print(f"[camera] open recovered reason={reason} attempt={attempt}/{self.camera_open_retries}")
+                    self._update_preview_state(status="Camera recovered", detail="Camera reopened successfully")
+                return True
+            except Exception as exc:
+                last_error = exc
+                print(
+                    f"[camera] open failed reason={reason} "
+                    f"attempt={attempt}/{self.camera_open_retries}: {exc}"
+                )
+                self._update_preview_state(
+                    status="Camera retry",
+                    detail=f"Open failed ({attempt}/{self.camera_open_retries}): {exc}",
+                )
+                self._close_camera()
+                if attempt < self.camera_open_retries:
+                    time.sleep(self.camera_retry_delay_seconds)
+
+        self.sender_error = str(last_error or "camera open failed")
+        return False
+
+    def _handle_camera_read_failure(self, consecutive_failures: int) -> bool:
+        if consecutive_failures > self.camera_read_retries:
+            self.sender_error = (
+                f"Camera read failed after {self.camera_read_retries} retry attempt(s)"
+            )
+            print(f"[camera] {self.sender_error}")
+            self._update_preview_state(status="Camera error", detail=self.sender_error)
+            return False
+
+        should_reopen = consecutive_failures >= self.camera_reopen_after_read_failures
+        if should_reopen:
+            print(
+                f"[camera] read failed attempt={consecutive_failures}/{self.camera_read_retries}; "
+                "reopening camera"
+            )
+            self._update_preview_state(
+                status="Camera reconnect",
+                detail=(
+                    f"Read failed ({consecutive_failures}/{self.camera_read_retries}); "
+                    "reopening camera"
+                ),
+            )
+            self._close_camera()
+            time.sleep(self.camera_retry_delay_seconds)
+            if self._open_camera_with_retries(reason="read-failure"):
+                print(f"[camera] read pipeline recovered after reopen attempt={consecutive_failures}")
+            return True
+
+        print(
+            f"[camera] read failed attempt={consecutive_failures}/{self.camera_read_retries}; retrying"
+        )
+        self._update_preview_state(
+            status="Camera retry",
+            detail=f"Read failed ({consecutive_failures}/{self.camera_read_retries}); retrying",
+        )
+        time.sleep(self.camera_retry_delay_seconds)
+        return True
+
     def run(self) -> None:
         self.audio_cues.start()
         self.publish_state()
@@ -1750,15 +1825,15 @@ class DashboardRealtimeChunkClient(sign_client.RealtimeChunkClient):
             f"chunk_frames={self.args.chunk_frames} upload_workers={self.upload_workers} "
             f"max_pending={self.args.max_pending_uploads} endpoint={self.chunk_endpoint} "
             f"request_timeout={self.args.request_timeout} "
-            f"server_stats_interval={self.args.server_stats_interval}"
+            f"server_stats_interval={self.args.server_stats_interval} "
+            f"camera_open_retries={self.camera_open_retries} "
+            f"camera_read_retries={self.camera_read_retries} "
+            f"camera_reopen_after={self.camera_reopen_after_read_failures}"
         )
-        try:
-            self._open_camera()
-        except Exception as exc:
-            print(f"[camera] failed: {exc}")
+        if not self._open_camera_with_retries(reason="startup"):
+            print(f"[camera] failed: {self.sender_error}")
             self.audio_cues.play("network_down", replace_current=True, priority=3)
-            self.sender_error = str(exc)
-            self._update_preview_state(status="Camera error", detail=str(exc))
+            self._update_preview_state(status="Camera error", detail=str(self.sender_error))
             self.stop_event.set()
             time.sleep(0.35)
             self._close_camera()
@@ -1804,6 +1879,7 @@ class DashboardRealtimeChunkClient(sign_client.RealtimeChunkClient):
         chunk_frame_sizes: list[int] = []
         brightness_mean_total = 0.0
         brightness_std_total = 0.0
+        consecutive_read_failures = 0
         run_started_at = time.perf_counter()
 
         try:
@@ -1817,15 +1893,39 @@ class DashboardRealtimeChunkClient(sign_client.RealtimeChunkClient):
 
                 loop_start = time.perf_counter()
                 read_started_at = time.perf_counter()
-                ok, frame = self.cap.read()
+                ok, frame = self.cap.read() if self.cap is not None else (False, None)
                 camera_read_seconds_total += time.perf_counter() - read_started_at
                 loop_count += 1
-                if not ok:
+                if not ok or frame is None:
                     if self.video_path:
                         print("[video] reached end of file, stopping capture")
-                    else:
-                        print("Camera read failed, stopping.")
-                    break
+                        break
+
+                    consecutive_read_failures += 1
+                    if current_chunk:
+                        print(
+                            f"[camera] dropping partial chunk during retry frames={len(current_chunk)}"
+                        )
+                    current_chunk = []
+                    chunk_frame_sizes = []
+                    current_chunk_start_ts_ms = 0.0
+                    sampled_frame_count = 0
+                    camera_read_seconds_total = 0.0
+                    resize_seconds_total = 0.0
+                    encode_seconds_total = 0.0
+                    loop_count = 0
+                    chunk_bytes_total = 0
+                    brightness_mean_total = 0.0
+                    brightness_std_total = 0.0
+                    self.current_chunk_len = 0
+                    if not self._handle_camera_read_failure(consecutive_read_failures):
+                        break
+                    continue
+
+                if consecutive_read_failures:
+                    print(f"[camera] read recovered after {consecutive_read_failures} failure(s)")
+                    self._update_preview_state(status="Connected", detail="Camera stream recovered")
+                    consecutive_read_failures = 0
 
                 resize_started_at = time.perf_counter()
                 frame = cv2.resize(frame, (self.args.width, self.args.height))
@@ -1927,7 +2027,12 @@ class DashboardRealtimeChunkClient(sign_client.RealtimeChunkClient):
             self.audio_cues.close()
             self._close_upload_sessions()
             self.session.close()
-            self._update_preview_state(status="Stopped", detail="Camera pipeline stopped")
+            final_detail = (
+                f"Camera pipeline stopped: {self.sender_error}"
+                if self.sender_error
+                else "Camera pipeline stopped"
+            )
+            self._update_preview_state(status="Stopped", detail=final_detail)
 
 
 class DualTranslatorDashboard:
