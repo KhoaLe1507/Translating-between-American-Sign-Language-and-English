@@ -63,6 +63,7 @@ REMOTE_POSE_DEFAULT_SERVER_URL = (
     "https://lequanganhkhoa2005--speech-to-pose-server-api-dev.modal.run/speech-to-pose"
 )
 REMOTE_AUDIO_DEFAULT_SAMPLE_RATE = 48_000
+REMOTE_MIC_DEVICE_DEFAULT = "hw:4,0"
 START_CLIENT_DEFAULT_REQUEST_TIMEOUT = 60.0
 START_CLIENT_DEFAULT_SERVER_STATS_INTERVAL = 1
 
@@ -257,6 +258,14 @@ def build_pose_arg_parser() -> argparse.ArgumentParser:
         "--remote-audio-latency",
         default=os.environ.get("REMOTE_AUDIO_LATENCY", "low"),
         help="sounddevice latency hint for remote-pose: low, high, or a numeric value.",
+    )
+    parser.add_argument(
+        "--remote-mic-device",
+        default=os.environ.get(
+            "REMOTE_MIC_DEVICE",
+            os.environ.get("MIC_DEVICE", REMOTE_MIC_DEVICE_DEFAULT),
+        ).strip(),
+        help="sounddevice input device used for Speech-to-Sign, e.g. hw:4,0.",
     )
     parser.add_argument(
         "--remote-max-pending-requests",
@@ -492,6 +501,7 @@ def parse_dual_args(argv: list[str]) -> tuple[argparse.Namespace, argparse.Names
     pose_args.remote_noise_calibration_seconds = max(0.0, float(pose_args.remote_noise_calibration_seconds))
     pose_args.remote_audio_block_ms = max(40.0, float(pose_args.remote_audio_block_ms))
     pose_args.remote_audio_latency = str(pose_args.remote_audio_latency).strip().lower() or "low"
+    pose_args.remote_mic_device = str(pose_args.remote_mic_device).strip()
     pose_args.remote_max_pending_requests = max(1, int(pose_args.remote_max_pending_requests))
     pose_args.remote_pose_upload_format = str(pose_args.remote_pose_upload_format).strip().lower()
     if pose_args.remote_pose_upload_format not in {"raw", "multipart"}:
@@ -776,6 +786,7 @@ class RemoteSpeechPoseClient:
         timeout: float,
         audio_block_ms: float,
         audio_latency: str,
+        mic_device: str,
         noise_calibration_seconds: float,
         max_pending_requests: int,
         upload_format: str,
@@ -794,6 +805,7 @@ class RemoteSpeechPoseClient:
         self.timeout = max(1.0, float(timeout))
         self.audio_block_seconds = max(0.04, float(audio_block_ms) / 1000.0)
         self.audio_latency = str(audio_latency or "low").strip().lower() or "low"
+        self.mic_device = str(mic_device or "").strip()
         self.noise_calibration_seconds = max(0.0, float(noise_calibration_seconds))
         self.max_pending_requests = max(1, int(max_pending_requests))
         self.upload_format = str(upload_format or "raw").strip().lower()
@@ -845,7 +857,7 @@ class RemoteSpeechPoseClient:
             return
 
         try:
-            input_device = sd.query_devices(kind="input")
+            stream_device, input_device = self._resolve_input_device(sd)
             input_channels = int(input_device.get("max_input_channels", 0))
             input_name = str(input_device.get("name", "default input"))
             if input_channels < 1:
@@ -854,6 +866,7 @@ class RemoteSpeechPoseClient:
                 return
             print(
                 "[Remote Speech Pose] input_device "
+                f"selector={self.mic_device or 'default'!r} resolved={stream_device!r} "
                 f"name={input_name!r} channels={input_channels} sample_rate={self.sample_rate}"
             )
         except Exception as exc:
@@ -934,6 +947,7 @@ class RemoteSpeechPoseClient:
             else:
                 self.on_status("Calibrating microphone noise")
             with sd.RawInputStream(
+                device=stream_device,
                 samplerate=self.sample_rate,
                 blocksize=blocksize,
                 dtype="int16",
@@ -1023,6 +1037,61 @@ class RemoteSpeechPoseClient:
             return float(self.audio_latency)
         except ValueError:
             return self.audio_latency
+
+    def _resolve_input_device(self, sd):
+        selector = self.mic_device
+        if not selector:
+            return None, sd.query_devices(kind="input")
+
+        try:
+            index = int(selector)
+            return index, sd.query_devices(index, kind="input")
+        except ValueError:
+            pass
+
+        try:
+            return selector, sd.query_devices(selector, kind="input")
+        except Exception as direct_exc:
+            selector_lower = selector.lower()
+            matches: list[tuple[int, object]] = []
+            for index, device in enumerate(sd.query_devices()):
+                try:
+                    channels = int(device.get("max_input_channels", 0))
+                    name = str(device.get("name", ""))
+                except AttributeError:
+                    continue
+                if channels > 0 and selector_lower in name.lower():
+                    matches.append((index, device))
+
+            if matches:
+                if len(matches) > 1:
+                    print(
+                        "[Remote Speech Pose] multiple input devices matched "
+                        f"{selector!r}; using index={matches[0][0]}"
+                    )
+                return matches[0]
+
+            self._print_input_devices(sd)
+            raise RuntimeError(f"microphone device {selector!r} not found") from direct_exc
+
+    @staticmethod
+    def _print_input_devices(sd) -> None:
+        print("[Remote Speech Pose] available input devices:", file=sys.stderr)
+        try:
+            for index, device in enumerate(sd.query_devices()):
+                try:
+                    channels = int(device.get("max_input_channels", 0))
+                    name = str(device.get("name", ""))
+                    hostapi = device.get("hostapi", "?")
+                except AttributeError:
+                    continue
+                if channels > 0:
+                    print(
+                        f"  index={index} name={name!r} channels={channels} hostapi={hostapi}",
+                        file=sys.stderr,
+                    )
+        except Exception as exc:
+            print(f"  failed to list input devices: {exc}", file=sys.stderr)
 
     def _estimate_wav_duration_ms(self, wav_bytes: bytes) -> float:
         try:
@@ -1258,6 +1327,7 @@ class SpeechPosePanel:
             timeout=args.remote_pose_timeout,
             audio_block_ms=args.remote_audio_block_ms,
             audio_latency=args.remote_audio_latency,
+            mic_device=args.remote_mic_device,
             noise_calibration_seconds=args.remote_noise_calibration_seconds,
             max_pending_requests=args.remote_max_pending_requests,
             upload_format=args.remote_pose_upload_format,
